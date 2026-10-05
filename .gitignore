@@ -1,0 +1,15 @@
+# secrets
+.env
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# regenerable / intermediate data — safe to delete and rebuild via src/pipeline/
+data/processed/
+data/snapshots/
+
+# large source datasets (re-download instead of committing)
+data/raw/*.nc

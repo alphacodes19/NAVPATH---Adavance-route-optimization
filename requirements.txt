@@ -1,0 +1,19 @@
+# Reconstructed from the actual imports in src/ — the original project shipped
+# with no requirements.txt at all, so there's no "original" version pins to
+# match. These are current, mutually-compatible versions as of testing.
+
+pygame
+opencv-python
+numpy
+pandas
+scikit-learn
+xgboost
+matplotlib
+shapely
+python-dotenv
+requests
+openmeteo-requests
+requests-cache
+retry-requests
+netCDF4
+aiohttp
