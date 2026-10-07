@@ -1,7 +1,14 @@
 import sys
 import math
+import threading
+import queue
 from pathlib import Path
 from queue import PriorityQueue
+import logging
+logging.basicConfig(level = logging.WARNING)
+from src.engine import depth_cells
+from src.engine import router as route_engine
+from src.engine.router import RouteParams, run_astar, compute_route_stats
 
 # allow running this file directly (`python src/app/main.py`) as well as
 # as a module (`python -m src.app.main`) from the project root
@@ -120,109 +127,28 @@ def build_land_mask():
                 land_cells.add((gx, gy))
     return land_cells
 
-LAND_CELLS = build_land_mask()
+LAND_CELLS = build_land_mask():
+    # --- Depth index (preloaded for O(1) lookup during A*) ---
+# depth_cells.process_csv() returns a dict keyed by "grid_x,grid_y" → depth (metres, negative = below sea level)
+# We convert to a (int, int) keyed dict for cleaner access.
+_DEPTH_CSV = str(config.PROCESSED_DIR / "output_depth_data.csv")
+_raw_depth = depth_cells.process_csv(_DEPTH_CSV) if __import__('os').path.exists(_DEPTH_CSV) else {}
+DEPTH_GRID = {
+    (int(k.split(',')[0]), int(k.split(',')[1])): v
+    for k, v in _raw_depth.items()
+}
+logging.info(f"Depth grid loaded: {len(DEPTH_GRID)} cells")
+
+# Default minimum safe depth (metres). Vessel draft increases this via get_ship_size_factor().
+# A typical coastal cargo ship has a draft of ~6-8m; we add a 2m safety margin.
+MIN_SAFE_DEPTH = -10.0  # -10m means at least 10m below sea level
 
  
-def is_aligned_with_wind(long, lat, dx, dy):
-    """
-    Determines if the movement direction (dx, dy) aligns with the wind direction.
-    
-    :param dx: Movement in the x-direction (grid coordinates)
-    :param dy: Movement in the y-direction (grid coordinates)
-    :return: 1 if aligned within a 12.5° range, 0 otherwise
-    """
-    
-    # Convert grid coordinates to geographical coordinates
-    geo_latitude = round_latitude(grid_to_latitude(lat))
-    geo_longitude = round_longitude(grid_to_longitude(long))
-    
-     
-    # Instantiate WindDirectionRetriever and retrieve wind direction for the given geographical location
-    wind_direction = wind_direction_retriever.retrieve_wind_direction(geo_longitude, geo_latitude)
-     
-    # Calculate and normalize the movement angle
-    movement_angle = round(math.degrees(math.atan2(dy, dx))) % 360
-
-    # Define the alignment range (±25° around the wind direction)
-    lower_bound = (wind_direction - 25) % 360
-    upper_bound = (wind_direction + 25) % 360
-    
-    
-
-    # Check if the movement angle is within the alignment range
-    if (lower_bound <= movement_angle <= upper_bound) or (lower_bound > upper_bound and (movement_angle >= lower_bound or movement_angle <= upper_bound)):
-        print(geo_longitude, geo_latitude, 1, wind_direction, movement_angle)
-        return 1
-    else:
-        print(geo_longitude, geo_latitude, 0, wind_direction, movement_angle)
-        return 0
-
-
-def is_aligned_with_current(long, lat, dx, dy):
-    """
-    Determines if the movement direction (dx, dy) aligns with the ocean current direction.
-    
-    :param long: Longitude in grid coordinates
-    :param lat: Latitude in grid coordinates
-    :param dx: Movement in the x-direction (grid coordinates)
-    :param dy: Movement in the y-direction (grid coordinates)
-    :return: 1 if aligned within a 25° range, 0 otherwise
-    """
-    
-    # Convert grid coordinates to geographical coordinates
-    geo_latitude = round_latitude(grid_to_latitude(lat))
-    geo_longitude = round_longitude(grid_to_longitude(long))
-    
-    # Instantiate CurrentRetriever and retrieve current direction for the given geographical location
-    current_direction = ocean_current_retriever.retrieve_angle(geo_longitude, geo_latitude)
-    
-    # Calculate and normalizing the movement angle
-    movement_angle = round(math.degrees(math.atan2(dy, dx))) % 360
-
-    # Alignment range (±25° around the current direction)
-    lower_bound = (current_direction - 25) % 360
-    upper_bound = (current_direction + 25) % 360
-    
-    # Checking if the movement angle is within the alignment range
-    if (lower_bound <= movement_angle <= upper_bound) or (lower_bound > upper_bound and (movement_angle >= lower_bound or movement_angle <= upper_bound)):
-        print(geo_longitude, geo_latitude, 1, current_direction, movement_angle)
-        return 1
-    else:
-        print(geo_longitude, geo_latitude, 0, current_direction, movement_angle)
-        return 0
-
+# AFTER — is_aligned_with_wind
 
     
 # A* Algorithm with new heuristic integration
-def euclidean(a, b):
-    return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
- 
-def h2_heuristic(node):
-    grid_x, grid_y = node
-    latitude = round_latitude(grid_to_latitude(grid_y))
-    longitude = round_longitude(grid_to_longitude(grid_x))
-    
-    heuristic_value = heuristic_retriever.get_heuristic_value(latitude, longitude, config.HEURISTICS_PKL)
-    print("h2:", heuristic_value)
-    return heuristic_value
 
-def h3_heuristic(node):
-    grid_x, grid_y = node
-    latitude = round_latitude(grid_to_latitude(grid_y))
-    longitude = round_longitude(grid_to_longitude(grid_x))
-    
-    heuristic_value = heuristic_retriever.get_heuristic_value(latitude, longitude,config.CARGO_PKL)
-    print("h3:", heuristic_value)
-    return heuristic_value
-
-def h4_heuristic(node):
-    grid_x, grid_y = node
-    latitude = round_latitude(grid_to_latitude(grid_y))
-    longitude = round_longitude(grid_to_longitude(grid_x))
-    
-    heuristic_value = heuristic_retriever.get_heuristic_value(latitude, longitude,config.PASSENGER_PKL)
-    print("h4:", heuristic_value)
-    return heuristic_value
 
 def get_ship_size_factor():
     """
@@ -251,150 +177,28 @@ def get_ship_size_factor():
     size_ratio = (length * beam * height) / reference_volume
     return size_ratio / efficiency
 
+def get_min_depth_for_vessel():
+    """
+    Derive minimum required depth from vessel dimensions if entered.
+    Draft is not directly in the L/B/H/Eff inputs, so we approximate:
+      - H (height) of the vessel is used as a proxy for draft (conservative estimate)
+      - If no H entered, fall back to MIN_SAFE_DEPTH constant
+    A future improvement: add a dedicated Draft input box.
+    """
+    try:
+        height = float(ui_elements.button_values[2])
+        if height > 0:
+            safety_margin = 2.0
+            return -(height + safety_margin)  # negative = below sea level
+    except (ValueError, IndexError):
+        pass
+    return MIN_SAFE_DEPTH
+
 
 #adjust this on the day of hackathon
-def calculate_fscore(g_score, current, neighbor, end, is_first_box_green, is_second_box_green, wind_alignment, current_alignment):
-    
-    f_score = 0
-    fuel_score = fuel_retriever.retrieve_fuel_efficiency(neighbor[0], neighbor[1])
-    print(fuel_score)
-    
-    # print(fuel_retriever(68.125, 8.5))
-    
-    if is_first_box_green:  # cargo
-        f_score = 0.3 * g_score + 0.7 * euclidean(neighbor, end) + 0.1 * h3_heuristic(neighbor)
-
-    elif is_second_box_green:  # passenger
-        f_score = 0.3 * g_score + 0.2 * euclidean(neighbor, end) + 1 * h4_heuristic(neighbor)
-         #combined 
-    
-    else: #individual optimisation
-        if horizontal_buttons[0]:  # Fuel
-            # BUG FIX: this used to multiply fuel_score into f_score before
-            # f_score had been set to anything (it was still 0 here), then
-            # immediately overwrite it on the next line — so fuel_score was
-            # silently never actually used. Applying it after f_score is
-            # computed instead: higher fuel efficiency modestly discounts
-            # cost, mirroring how wind/current alignment do below.
-            f_score = 0.4 * g_score + 0.2 * euclidean(neighbor, end) + 0.1 * h2_heuristic(neighbor)
-            f_score *= (1 - 0.1 * fuel_score)
-            
-        elif horizontal_buttons[1]:  # Speed
-            f_score = 0.3 * g_score + 0.7 * euclidean(neighbor, end) + 0.1 * h2_heuristic(neighbor)
-            
-        elif horizontal_buttons[2]:  # Comfort
-            f_score = 0.3 * g_score + 0.2 * euclidean(neighbor, end) + 1 * h2_heuristic(neighbor)
-            
-        else:
-            # BUG FIX: this used to leave f_score at 0 for every node when
-            # Individual mode was active (or just the default state) but no
-            # Fuel/Speed/Comfort button had been picked yet — meaning A*
-            # couldn't distinguish any neighbor from any other and the
-            # search degenerated into an arbitrary, unguided crawl. Falling
-            # back to the same balanced formula Speed uses keeps the search
-            # meaningful even before a sub-priority is chosen.
-            f_score = 0.3 * g_score + 0.7 * euclidean(neighbor, end) + 0.1 * h2_heuristic(neighbor)
-
-    f_score *= get_ship_size_factor()
-
-    if wind_alignment == 1:
-        f_score *= 0.9
-        
-    if current_alignment ==1:
-        f_score *= 0.9
-        
-    
-    return f_score
-
-
-def a_star(start, end, is_first_box_green, is_second_box_green):
-    open_set = PriorityQueue()
-    open_set.put((0, start))
-    came_from = {}
-    g_score = {start: 0}
-    f_score = {start: calculate_fscore(g_score[start], start, start, end, is_first_box_green, is_second_box_green, 0, 0)}  # Initial alignment is 0 (not used yet)
-    explored_nodes = []
-
-    while not open_set.empty():
-        _, current = open_set.get()
-
-        # Visualize exploration
-        if current != start and current != end:
-            explored_nodes.append(current)
-            pygame.draw.rect(screen, RED, (map_position[0] + current[0] * grid_size,
-                                           map_position[1] + current[1] * grid_size,
-                                           grid_size, grid_size))
-            pygame.display.flip()
-            pygame.time.delay(20)  # Slow down to visualize
-        
-        if current == end:
-            path = []
-            while current in came_from:
-                path.append(current)
-                current = came_from[current]
-            path.reverse()
-            
-            # Reconstructing the green path
-            background()
-            drawGrid()
-            # foreground() removed here — it was only ever needed to draw the
-            # black land/sea mask so is_black_pixel() could read it back off
-            # the screen. Now that build_land_mask() precomputes that once,
-            # the visible map no longer needs the ugly overlay on it.
-            weather_display.weather(screen, 28.6139, 77.2090)
-            weather_display.weatherTwo(screen, 35.00, 45.2090)
-            ui_elements.draw_fuel_estimation_button(screen)
-            ui_elements.draw_image_analysis_button(screen)
-            ui_elements.draw_retrain_model_button(screen)
-            ui_elements.draw_path_coordinates_button(screen)
-            ui_elements.draw_dim_boxes(screen)
-            
-            pygame.display.flip()
-            pygame.time.delay(500) 
-            
-            # Draw path on screen
-            for cell in path:
-                pygame.draw.rect(screen, GREEN, (map_position[0] + cell[0] * grid_size,
-                                                 map_position[1] + cell[1] * grid_size,
-                                                 grid_size, grid_size))
-                pygame.display.flip()
-                pygame.time.delay(200)
-                print("Path:", cell)
-                
-            pygame.time.delay(5000)
-            
-            return path, explored_nodes
-
-        neighbors = get_neighbors(current)
-        for neighbor, wind_alignment, current_alignment in neighbors:
-            tentative_g_score = g_score[current] + euclidean(current, neighbor)
-            tentative_f_score = calculate_fscore(tentative_g_score, current, neighbor, end, is_first_box_green, is_second_box_green, wind_alignment, current_alignment)
-            
-            if neighbor not in g_score or tentative_g_score < g_score[neighbor]:
-                came_from[neighbor] = current
-                g_score[neighbor] = tentative_g_score
-                f_score[neighbor] = tentative_f_score
-                open_set.put((f_score[neighbor], neighbor))
-
-    return None, explored_nodes
-
-blocks = storage.Backup_black_cells #remove if changing the map
+# In calculate_fscore, add this at the very top of the function, before anything else:
 
 # Get neighbors for A* (8-way movement)
-def get_neighbors(position):
-    neighbors = []
-    directions = [(0, 1), (1, 0), (0, -1), (-1, 0), (1, 1), (-1, -1), (1, -1), (-1, 1)]
-    
-    for dx, dy in directions:
-        nx, ny = position[0] + dx, position[1] + dy
-        if 0 <= nx < grid_width/grid_size and 0 <= ny < grid_height/grid_size:
-            if not is_black_pixel(nx, ny) and (nx, ny) not in blocks:
-                # Check if the movement is aligned with the wind
-                wind_alignment = is_aligned_with_wind(position[0]+dx, position[1]+dy, dx, dy)
-                current_alignment = is_aligned_with_current(position[0]+dx, position[1]+dy, dx, dy)
-                # Append the neighbor along with the wind alignment value
-                neighbors.append(((nx, ny), wind_alignment, current_alignment))
-    return neighbors
 
 
 # Function to check if a pixel is black — now a fast lookup against the
@@ -441,52 +245,39 @@ def draw_status_message(screen):
         screen.blit(text, box)
 
 while running:
+    # AFTER (correctly merged)
     for event in pygame.event.get():
         if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE):
             running = False
+
         if event.type == pygame.MOUSEBUTTONDOWN:
+            # --- Button clicks ---
             if ui_elements.draw_button(screen, show_input_boxes).collidepoint(event.pos):
                 show_input_boxes = not show_input_boxes
-            if ui_elements.draw_start_button(screen).collidepoint(event.pos):  # Check if Start button is clicked
-                start_button_clicked = True  # Set the flag when the start button is clicked
-                exploration_done = False  # Reset exploration_done to allow a new search
+            if ui_elements.draw_start_button(screen).collidepoint(event.pos):
+                start_button_clicked = True
+                exploration_done = False
             ui_elements.handle_mouse_click(event)
-        
-        if event.type == pygame.MOUSEBUTTONDOWN:
+
+            # --- Map clicks ---
             mouse_x, mouse_y = event.pos
-            
-            if(map_position[0]<=mouse_x<map_position[0]+550 and map_position[1]<=mouse_y<map_position[1]+600):
+            if (map_position[0] <= mouse_x < map_position[0] + 550 and
+                    map_position[1] <= mouse_y < map_position[1] + 600):
                 grid_x = (mouse_x - map_position[0]) // grid_size
                 grid_y = (mouse_y - map_position[1]) // grid_size
-                
+
                 if selected_start is None:
-                    if not is_black_pixel(grid_x, grid_y) and grid_y>78:  # Check the grid_x, grid_y pixel
+                    if not is_black_pixel(grid_x, grid_y) and grid_y > 78:
                         selected_start = (grid_x, grid_y)
                     else:
                         set_status("The selected coordinate is invalid, please try again!")
-                        
-
                 elif selected_end is None:
-                    if not is_black_pixel(grid_x, grid_y) and grid_y>78:  # Check the grid_x, grid_y pixel
+                    if not is_black_pixel(grid_x, grid_y) and grid_y > 78:
                         selected_end = (grid_x, grid_y)
                     else:
                         set_status("The selected coordinate is invalid, please try again!")
-
                 else:
                     selected_start, selected_end = None, None
-                
-        if selected_start:
-            pygame.draw.rect(screen, GREEN, (map_position[0] + selected_start[0] * grid_size,
-                                         map_position[1] + selected_start[1] * grid_size,
-                                         grid_size, grid_size))
-            
-        if selected_end:
-            pygame.draw.rect(screen, RED, (map_position[0] + selected_end[0] * grid_size,
-                                       map_position[1] + selected_end[1] * grid_size,
-                                       grid_size, grid_size))
-        
-        pygame.display.flip()
-
 
         if show_input_boxes:
             ui_elements.handle_input(event)
@@ -540,7 +331,7 @@ while running:
                 # Use CoordConv functions to convert to grid coordinates
                 start = (longitude_to_grid(start_longitude), latitude_to_grid(start_latitude))
                 end = (longitude_to_grid(end_longitude), latitude_to_grid(end_latitude))
-                print(start,end)
+                logging.info(f"A* start={start} end={end}")
                 # Validate the grid coordinates
                 if 0 <= start[0] < grid_width and 0 <= start[1] < grid_height and \
                 0 <= end[0] < grid_width and 0 <= end[1] < grid_height:

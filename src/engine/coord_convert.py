@@ -1,70 +1,41 @@
+# Named constants for the grid-to-geography mapping.
+# These four values appear in four functions — centralising them means
+# changing the grid bounds only needs to happen in one place.
+NORTH_LAT = 37.1
+NORTH_GRID_Y = 9
+SOUTH_LAT = 8.1
+SOUTH_GRID_Y = 135
+
+WEST_LON = 68.1167
+EAST_LON = 97.4167
+WEST_GRID_X = 16
+EAST_GRID_X = 121
+
+_LAT_PER_CELL = (NORTH_LAT - SOUTH_LAT) / (NORTH_GRID_Y - SOUTH_GRID_Y)
+_LON_PER_CELL = (EAST_LON - WEST_LON) / (EAST_GRID_X - WEST_GRID_X)
+
+
 def grid_to_latitude(grid_y):
-    northernmost_latitude = 37.1
-    northernmost_grid_y = 9
-    southernmost_latitude = 8.1
-    southernmost_grid_y = 135
-    latitude_per_cell = (northernmost_latitude - southernmost_latitude) / (northernmost_grid_y - southernmost_grid_y)
-    latitude = northernmost_latitude + (grid_y - northernmost_grid_y) * latitude_per_cell
-    latitude = round(latitude / 0.250) * 0.250
-    return round(latitude, 3) 
+    latitude = NORTH_LAT + (grid_y - NORTH_GRID_Y) * _LAT_PER_CELL
+    return round(round(latitude / 0.250) * 0.250, 3)
+
 
 def grid_to_longitude(grid_x):
-    westernmost_longitude = 68.1167
-    easternmost_longitude = 97.4167
-    westernmost_grid_x = 16
-    easternmost_grid_x = 121
-    longitude_per_cell = (easternmost_longitude - westernmost_longitude) / (easternmost_grid_x - westernmost_grid_x)
-    longitude = westernmost_longitude + (grid_x - westernmost_grid_x) * longitude_per_cell
-    # Modify rounding for longitude to nearest multiple of 0.250 starting from 0.125
-    longitude = round((longitude - 0.125) / 0.250) * 0.250 + 0.125
-    return round(longitude, 3) 
+    longitude = WEST_LON + (grid_x - WEST_GRID_X) * _LON_PER_CELL
+    return round(round((longitude - 0.125) / 0.250) * 0.250 + 0.125, 3)
+
 
 def latitude_to_grid(latitude):
-    northernmost_latitude = 37.1
-    northernmost_grid_y = 9
-    southernmost_latitude = 8.1
-    southernmost_grid_y = 135
-    latitude_per_cell = (northernmost_latitude - southernmost_latitude) / (northernmost_grid_y - southernmost_grid_y)
-    grid_y = northernmost_grid_y + (latitude - northernmost_latitude) / latitude_per_cell
-    grid_y = round(grid_y)
-    return grid_y
+    return round(NORTH_GRID_Y + (latitude - NORTH_LAT) / _LAT_PER_CELL)
+
 
 def longitude_to_grid(longitude):
-    westernmost_longitude = 68.1167
-    easternmost_longitude = 97.4167
-    westernmost_grid_x = 16
-    easternmost_grid_x = 121
-    longitude_per_cell = (easternmost_longitude - westernmost_longitude) / (easternmost_grid_x - westernmost_grid_x)
-    grid_x = westernmost_grid_x + (longitude - westernmost_longitude) / longitude_per_cell
-    grid_x = round(grid_x)
-    return grid_x
+    return round(WEST_GRID_X + (longitude - WEST_LON) / _LON_PER_CELL)
+
 
 def round_latitude(latitude):
-    """
-    Rounds a latitude to the nearest multiple of 0.250.
-    """
-    rounded_latitude = round(latitude / 0.250) * 0.250
-    return round(rounded_latitude, 3)  
+    return round(round(latitude / 0.250) * 0.250, 3)
+
 
 def round_longitude(longitude):
-    """
-    Rounds a longitude to the nearest multiple of 0.250, starting from 0.125.
-    """
-    rounded_longitude = round((longitude - 0.125) / 0.250) * 0.250 + 0.125
-    return round(rounded_longitude, 3)   
-
-running = True
-
-# while running:
-#     # Testing grid to latitude and longitude
-#     print("Latitude = ", grid_to_latitude(123))
-#     print("Longitude = ", grid_to_longitude(103))
-
-#     # Testing latitude and longitude to grid
-#     print("Grid Y for latitude =", latitude_to_grid(10.80))
-#     print("Grid X for longitude = ", longitude_to_grid(92.41))
-    
-#     # Testing rounding functions
-#     print(round_latitude(101.134))
-#     print(round_longitude(101.134))
-#     running = False
+    return round(round((longitude - 0.125) / 0.250) * 0.250 + 0.125, 3)
