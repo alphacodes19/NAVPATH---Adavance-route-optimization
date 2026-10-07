@@ -1,25 +1,23 @@
+# AFTER
 import pickle
-import pandas as pd
-
+import logging
 from src import config
 
 
 class FuelEfficiencyRetriever:
     def __init__(self, pkl_file=None):
         pkl_file = pkl_file or config.FUEL_PKL
-        # Load the data once during initialization
         with open(pkl_file, 'rb') as f:
-            self.data = pickle.load(f)
+            data = pickle.load(f)
+        self._index = {
+            (round(row['Longitude'], 3), round(row['Latitude'], 3)): row['fuel_efficiency']
+            for _, row in data.iterrows()
+        }
+        logging.info(f"FuelEfficiencyRetriever: indexed {len(self._index)} coordinates")
 
     def retrieve_fuel_efficiency(self, longitude, latitude):
-        # Filter the data based on the provided longitude and latitude
-        result = self.data[(self.data['Longitude'] == longitude) & (self.data['Latitude'] == latitude)]
-
-        # Return the fuel efficiency score or a default value (e.g., 0) if not found
-        if not result.empty:
-            return result['fuel_efficiency'].values[0]
-        else:
-            return 0  # Default value if coordinates are not found
+        key = (round(longitude, 3), round(latitude, 3))
+        return self._index.get(key, 0)  # Default value if coordinates are not found
 
 if __name__ == "__main__":
     retriever = FuelEfficiencyRetriever()
