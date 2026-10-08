@@ -4,6 +4,7 @@ from pathlib import Path
 import pygame
 
 from src.data.ports import PORTS
+from src.engine.snapshot_heuristics import list_available_dates
 
 # --- Font loading -----------------------------------------------------
 # Roboto, loaded once per size and cached, instead of the scattered
@@ -79,6 +80,21 @@ _PORT_SEL_Y = 25
 _PORT_ARROW_W = 30
 _PORT_ARROW_H = 34
 _PORT_NAME_W = 220
+
+# --- Historical snapshot date selector (Phase 2C) --------------------------
+# "a" drives the single Calculate route (2C-1/2C-2); "a" + "b" together
+# drive the "Compare Dates" overlay (2C-3). Sits in the gap between the
+# mode/sub-priority buttons (ends ~y406) and the stats panel (starts y550).
+date_selection = -1    # index into list_available_dates(); -1 = Default (trained PKL, no override)
+date_b_selection = -1  # second date, only used by the Compare Dates button
+
+_DATE_SEL_X = {"a": 670, "b": 970}
+_DATE_SEL_Y_TITLE = 409
+_DATE_SEL_Y = 425
+_DATE_SEL_H = 30
+_DATE_ARROW_W = 30
+_DATE_NAME_W = 220
+_DATE_DIFF_BTN_RECT = pygame.Rect(670, 465, 580, 34)
 
 
 # Function to draw gradient-filled rounded rectangles
@@ -182,6 +198,95 @@ def handle_port_selector_click(event) -> bool:
             port_selection[col] = port_selection[col] + 1 if port_selection[col] < len(PORTS) - 1 else -1
             _apply_port_selection(col)
             return True
+    return False
+
+
+def _date_label(index: int) -> str:
+    dates = list_available_dates()
+    if index == -1 or index >= len(dates):
+        return "Default (PKL)"
+    return dates[index]
+
+
+def draw_date_selectors(screen):
+    """
+    Draw the "Historical Date" selector (affects the single Calculate
+    route — Phase 2C-1/2C-2), the "Compare With" selector, and the
+    Compare Dates button that runs both through router.run_date_comparison()
+    (Phase 2C-3). Always visible, independent of show_input_boxes — the
+    date choice applies whether start/end came from the map or typed
+    coordinates. Returns the Compare Dates button rect for click hit-testing.
+    """
+    font = get_font(18, bold=True)
+    title_font = get_font(15)
+    titles = {"a": "Historical Date (used by Calculate)", "b": "Compare With"}
+    selections = {"a": date_selection, "b": date_b_selection}
+
+    for key, x in _DATE_SEL_X.items():
+        title_text = title_font.render(titles[key], True, (180, 180, 180))
+        screen.blit(title_text, (x, _DATE_SEL_Y_TITLE))
+
+        left_rect = pygame.Rect(x, _DATE_SEL_Y, _DATE_ARROW_W, _DATE_SEL_H)
+        name_rect = pygame.Rect(x + _DATE_ARROW_W, _DATE_SEL_Y, _DATE_NAME_W, _DATE_SEL_H)
+        right_rect = pygame.Rect(x + _DATE_ARROW_W + _DATE_NAME_W, _DATE_SEL_Y,
+                                  _DATE_ARROW_W, _DATE_SEL_H)
+
+        pygame.draw.rect(screen, (40, 60, 90), name_rect, border_radius=4)
+        pygame.draw.rect(screen, BUTTON_BORDER_COLOR, name_rect, width=1, border_radius=4)
+        for rect in (left_rect, right_rect):
+            pygame.draw.rect(screen, (60, 90, 130), rect, border_radius=4)
+
+        pygame.draw.polygon(screen, WHITE, [
+            (left_rect.centerx + 4, left_rect.centery - 7),
+            (left_rect.centerx + 4, left_rect.centery + 7),
+            (left_rect.centerx - 5, left_rect.centery),
+        ])
+        pygame.draw.polygon(screen, WHITE, [
+            (right_rect.centerx - 4, right_rect.centery - 7),
+            (right_rect.centerx - 4, right_rect.centery + 7),
+            (right_rect.centerx + 5, right_rect.centery),
+        ])
+
+        label = font.render(_date_label(selections[key]), True, WHITE)
+        screen.blit(label, (name_rect.centerx - label.get_width() // 2,
+                             name_rect.centery - label.get_height() // 2))
+
+    draw_gradient_button(screen, _DATE_DIFF_BTN_RECT, (90, 70, 160), (60, 45, 120))
+    diff_font = get_font(22)
+    diff_text = diff_font.render("Compare Dates (A vs B)", True, BUTTON_TEXT_COLOR)
+    screen.blit(diff_text, (_DATE_DIFF_BTN_RECT.centerx - diff_text.get_width() // 2,
+                             _DATE_DIFF_BTN_RECT.centery - diff_text.get_height() // 2))
+    return _DATE_DIFF_BTN_RECT
+
+
+def handle_date_selector_click(event) -> bool:
+    """
+    Handle a MOUSEBUTTONDOWN on the date-selector arrows (not the Compare
+    Dates button itself — main.py checks that one via the rect
+    draw_date_selectors() returns, same convention as the other buttons).
+    Returns True if the click was consumed by an arrow.
+    """
+    global date_selection, date_b_selection
+    n = len(list_available_dates())
+
+    for key, x in _DATE_SEL_X.items():
+        left_rect = pygame.Rect(x, _DATE_SEL_Y, _DATE_ARROW_W, _DATE_SEL_H)
+        right_rect = pygame.Rect(x + _DATE_ARROW_W + _DATE_NAME_W, _DATE_SEL_Y,
+                                  _DATE_ARROW_W, _DATE_SEL_H)
+
+        current = date_selection if key == "a" else date_b_selection
+        if left_rect.collidepoint(event.pos):
+            new_val = (current - 1) if current > -1 else (n - 1 if n else -1)
+        elif right_rect.collidepoint(event.pos):
+            new_val = (current + 1) if current < n - 1 else -1
+        else:
+            continue
+
+        if key == "a":
+            date_selection = new_val
+        else:
+            date_b_selection = new_val
+        return True
     return False
 
 

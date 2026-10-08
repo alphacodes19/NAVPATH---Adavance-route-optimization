@@ -21,6 +21,7 @@ from src.engine import wind_retriever as wind_retriever_module
 from src.engine import current_retriever as current_retriever_module
 from src.engine import fuel_retriever as fuel_retriever_module
 from src.engine import storage
+from src.engine import snapshot_heuristics
 from src import config
 
 # ---------------------------------------------------------------------------
@@ -62,6 +63,7 @@ class RouteParams:
         depth_grid: dict = None,
         ship_size_factor: float = 1.0,
         min_depth: float = -10.0,
+        heuristic_override: dict = None,
     ):
         self.start = start
         self.end = end
@@ -70,6 +72,10 @@ class RouteParams:
         self.depth_grid = depth_grid or {}
         self.ship_size_factor = ship_size_factor
         self.min_depth = min_depth
+        # Phase 2C: when set, A* reads heuristic values from this
+        # {(lon, lat): float} dict (one day's weather snapshot) instead
+        # of the trained heuristics_data.pkl — see snapshot_heuristics.py.
+        self.heuristic_override = heuristic_override
 
 
 # ---------------------------------------------------------------------------
@@ -113,10 +119,15 @@ def _depth_penalty(cell: tuple, depth_grid: dict, min_depth: float) -> float:
     return 0.0
 
 
-def _heuristic_value(cell: tuple, pkl_path: str) -> float:
+def _heuristic_value(cell: tuple, pkl_path: str, heuristic_override: dict = None) -> float:
     gx, gy = cell
     lat = round_latitude(grid_to_latitude(gy))
     lon = round_longitude(grid_to_longitude(gx))
+    if heuristic_override:
+        # Phase 2C: a snapshot override replaces the PKL entirely for this
+        # lookup — same (lon, lat) key convention as HeuristicRetriever,
+        # same 0.5 neutral fallback when the cell isn't in the snapshot.
+        return heuristic_override.get((lon, lat), 0.5)
     return _heuristic_retriever.get_heuristic_value(lat, lon, pkl_path)
 
 
@@ -130,29 +141,32 @@ def calculate_fscore(
     fuel_score: float,
     depth_pen: float,
     ship_factor: float,
+    heuristic_override: dict = None,
 ) -> float:
     """
     Compute the A* f-score for a neighbor cell.
 
     All environmental factors (wind, current, depth, fuel) are included.
-    The mode selects which weight combination to use.
+    The mode selects which weight combination to use. heuristic_override,
+    when given, redirects every _heuristic_value() lookup below to a
+    snapshot-day dict instead of the trained PKL (Phase 2C).
     """
     euclid = _euclidean(neighbor, end)
 
     if mode == "cargo":
-        f = 0.3 * g + 0.7 * euclid + 0.1 * _heuristic_value(neighbor, config.CARGO_PKL)
+        f = 0.3 * g + 0.7 * euclid + 0.1 * _heuristic_value(neighbor, config.CARGO_PKL, heuristic_override)
     elif mode == "passenger":
-        f = 0.3 * g + 0.2 * euclid + 1.0 * _heuristic_value(neighbor, config.PASSENGER_PKL)
+        f = 0.3 * g + 0.2 * euclid + 1.0 * _heuristic_value(neighbor, config.PASSENGER_PKL, heuristic_override)
     elif mode == "fuel":
-        f = 0.4 * g + 0.2 * euclid + 0.1 * _heuristic_value(neighbor, config.HEURISTICS_PKL)
+        f = 0.4 * g + 0.2 * euclid + 0.1 * _heuristic_value(neighbor, config.HEURISTICS_PKL, heuristic_override)
         f *= (1 - 0.1 * fuel_score)
     elif mode == "speed":
-        f = 0.3 * g + 0.7 * euclid + 0.1 * _heuristic_value(neighbor, config.HEURISTICS_PKL)
+        f = 0.3 * g + 0.7 * euclid + 0.1 * _heuristic_value(neighbor, config.HEURISTICS_PKL, heuristic_override)
     elif mode == "comfort":
-        f = 0.3 * g + 0.2 * euclid + 1.0 * _heuristic_value(neighbor, config.HEURISTICS_PKL)
+        f = 0.3 * g + 0.2 * euclid + 1.0 * _heuristic_value(neighbor, config.HEURISTICS_PKL, heuristic_override)
     else:
         # Default: speed-like balanced formula
-        f = 0.3 * g + 0.7 * euclid + 0.1 * _heuristic_value(neighbor, config.HEURISTICS_PKL)
+        f = 0.3 * g + 0.7 * euclid + 0.1 * _heuristic_value(neighbor, config.HEURISTICS_PKL, heuristic_override)
 
     # Depth penalty (additive — makes shallow cells more expensive)
     f += depth_pen
@@ -253,6 +267,7 @@ def run_astar(
                 tentative_g, neighbor, end,
                 params.mode, wind_align, current_align,
                 fuel_score, depth_pen, params.ship_size_factor,
+                heuristic_override=params.heuristic_override,
             )
 
             if neighbor not in g_score or tentative_g < g_score[neighbor]:
@@ -307,6 +322,47 @@ def run_multi_route(params_base: RouteParams, progress_callback: Optional[Callab
             logging.warning(f"run_multi_route: no path found for mode '{mode}' (key '{key}')")
 
         results[key] = {"path": path, "stats": stats}
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Historical voyage simulation — two-date overlay (Phase 2C-3)
+# ---------------------------------------------------------------------------
+def run_date_comparison(
+    params_base: RouteParams,
+    date_a: str,
+    date_b: str,
+    progress_callback: Optional[Callable] = None,
+) -> dict:
+    """
+    Run the same start/end/mode route twice, once under each snapshot
+    date's weather conditions (see src/engine/snapshot_heuristics.py),
+    so the two can be drawn as an overlay with a stat-diff panel.
+
+    params_base.heuristic_override is ignored here — each run gets its
+    own override built from date_a / date_b respectively.
+
+    Returns:
+        {
+          'a': {'date': date_a, 'path': [...] or None, 'stats': {...}},
+          'b': {'date': date_b, 'path': [...] or None, 'stats': {...}},
+        }
+    """
+    results = {}
+    for key, date_str in (("a", date_a), ("b", date_b)):
+        params = copy.copy(params_base)
+        params.heuristic_override = snapshot_heuristics.load_snapshot_heuristic(date_str)
+
+        path, explored = run_astar(params, progress_callback=progress_callback)
+
+        if path:
+            stats = compute_route_stats(path, params.depth_grid, _fuel_retriever._index)
+        else:
+            stats = {}
+            logging.warning(f"run_date_comparison: no path found for date '{date_str}' (key '{key}')")
+
+        results[key] = {"date": date_str, "path": path, "stats": stats}
 
     return results
 

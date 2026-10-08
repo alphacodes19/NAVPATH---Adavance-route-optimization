@@ -268,6 +268,109 @@ def draw_comparison_panel(screen, multi_routes: dict, selected_key: str,
     return header_rects
 
 
+def draw_date_diff_panel(screen, date_diff_results: dict, vessel_speed_knots: float = 12.0):
+    """
+    Side-by-side table for router.run_date_comparison() — the same
+    route calculated under two different historical weather snapshots
+    (Phase 2C-3). Reuses the same screen region as draw_route_panel() /
+    draw_comparison_panel(); the three are mutually exclusive.
+
+    Args:
+        screen:              pygame display surface
+        date_diff_results:   {'a': {'date':..., 'path':..., 'stats':...}, 'b': {...}}
+        vessel_speed_knots:  used for the ETA row
+    """
+    if not date_diff_results:
+        return
+
+    panel_x, panel_y, panel_w, panel_h = 670, 550, 560, 220
+
+    pygame.draw.rect(screen, PANEL_BORDER,
+                      (panel_x - 2, panel_y - 2, panel_w + 4, panel_h + 4),
+                      border_radius=10)
+    pygame.draw.rect(screen, PANEL_BG,
+                      (panel_x, panel_y, panel_w, panel_h),
+                      border_radius=10)
+
+    font_title = get_font(26)
+    font_label = get_font(20)
+    font_value = get_font(22)
+    font_delta = get_font(16)
+
+    title = font_title.render("DATE COMPARISON", True, TITLE_COLOUR)
+    screen.blit(title, (panel_x + 12, panel_y + 10))
+    pygame.draw.line(screen, PANEL_BORDER,
+                      (panel_x + 10, panel_y + 36),
+                      (panel_x + panel_w - 10, panel_y + 36))
+
+    data_a = date_diff_results.get("a", {})
+    data_b = date_diff_results.get("b", {})
+    colours = {"a": (0, 200, 255), "b": (255, 120, 0)}      # cyan / orange — matches main.py's route colours
+    col_labels = {"a": data_a.get("date", "A"), "b": data_b.get("date", "B")}
+
+    label_col_w = 140
+    col_w = (panel_w - label_col_w - 16) // 2
+    col_x = {"a": panel_x + 16 + label_col_w, "b": panel_x + 16 + label_col_w + col_w}
+
+    header_y = panel_y + 44
+    for key in ("a", "b"):
+        rect = pygame.Rect(col_x[key], header_y, col_w - 8, 30)
+        pygame.draw.rect(screen, colours[key], rect, 2, border_radius=6)
+        lbl = font_label.render(col_labels[key], True, colours[key])
+        screen.blit(lbl, (rect.centerx - lbl.get_width() // 2, rect.centery - lbl.get_height() // 2))
+
+    row_labels = ["Distance", "ETA", "Fuel Index", "Min Depth"]
+    row_y_start = header_y + 40
+    row_gap = 34
+
+    for ri, row_label in enumerate(row_labels):
+        ly = row_y_start + ri * row_gap
+        lbl = font_label.render(row_label, True, LABEL_COLOUR)
+        screen.blit(lbl, (panel_x + 16, ly))
+
+        raw_values = {}
+        for key, data in (("a", data_a), ("b", data_b)):
+            stats = data.get("stats") or {}
+            path = data.get("path")
+
+            if not path:
+                val_text, colour, raw = "no route", BAD_COLOUR, None
+            elif row_label == "Distance":
+                d = stats.get("distance_nm")
+                val_text, colour, raw = (f"{d} nm" if d is not None else "—"), VALUE_COLOUR, d
+            elif row_label == "ETA":
+                d = stats.get("distance_nm")
+                if d and vessel_speed_knots > 0:
+                    eta_h = int(d / vessel_speed_knots)
+                    eta_m = int(((d / vessel_speed_knots) - eta_h) * 60)
+                    val_text = f"{eta_h}h {eta_m:02d}m"
+                else:
+                    val_text = "—"
+                colour, raw = VALUE_COLOUR, None
+            elif row_label == "Fuel Index":
+                f = stats.get("fuel_index")
+                val_text, colour, raw = (f"{f:.3f}" if f is not None else "—"), VALUE_COLOUR, f
+            else:  # Min Depth
+                m = stats.get("min_depth_m")
+                val_text, colour, raw = (f"{m} m" if m is not None else "no data"), _depth_colour(m), m
+
+            val = font_value.render(val_text, True, colour)
+            screen.blit(val, (col_x[key] + (col_w - 8 - val.get_width()) // 2, ly))
+            raw_values[key] = raw
+
+        # Δ (B minus A) when both sides produced a comparable number
+        if raw_values.get("a") is not None and raw_values.get("b") is not None:
+            delta = raw_values["b"] - raw_values["a"]
+            sign = "+" if delta >= 0 else ""
+            decimals = 1 if row_label == "Distance" else 3
+            delta_surf = font_delta.render(f"Δ {sign}{delta:.{decimals}f}", True, (150, 150, 170))
+            screen.blit(delta_surf, (panel_x + panel_w - delta_surf.get_width() - 10, ly + 6))
+
+    note = font_label.render("Cyan = Date A route · Orange = Date B route",
+                              True, (100, 100, 120))
+    screen.blit(note, (panel_x + 12, panel_y + panel_h - 26))
+
+
 def draw_fuel_detail(screen, stats: dict, ship_factor: float):
     """
     Overlay panel showing fuel estimation breakdown.

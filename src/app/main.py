@@ -24,8 +24,10 @@ from src.engine.coord_convert import (
 from src.engine import storage  # For the map boundary
 from src.engine import depth_cells
 from src.engine import router as route_engine
+from src.engine import snapshot_heuristics
 from src.engine.router import (
-    RouteParams, run_astar, run_multi_route, compute_route_stats, explain_route,
+    RouteParams, run_astar, run_multi_route, run_date_comparison,
+    compute_route_stats, explain_route,
 )
 from src.engine.exporter import export_csv, export_gpx
 
@@ -204,6 +206,39 @@ def is_black_pixel(x, y):
     return (x, y) in LAND_CELLS
 
 
+def _date_diff_thread_worker(params_base: RouteParams, date_a: str, date_b: str, result_queue: queue.Queue):
+    """
+    Runs run_date_comparison() (Phase 2C-3) on a background thread.
+    Never touches pygame directly.
+    """
+    def on_cell_explored(cell):
+        result_queue.put({"type": "explored", "cell": cell})
+
+    try:
+        results = run_date_comparison(params_base, date_a, date_b, progress_callback=on_cell_explored)
+        result_queue.put({"type": "date_diff_done", "results": results})
+    except Exception as e:
+        logging.exception("Date comparison thread failed")
+        result_queue.put({"type": "error", "msg": str(e)})
+
+
+def _draw_date_diff_routes(screen):
+    """Draw both historical-date routes on the map — A first, then B on top."""
+    colours = {"a": ROUTE_COLOR_DATE_A, "b": ROUTE_COLOR_DATE_B}
+    for key in ("a", "b"):
+        path = _date_diff_results.get(key, {}).get("path")
+        if not path:
+            continue
+        colour = colours[key]
+        for cell in path:
+            pygame.draw.rect(
+                screen, colour,
+                (map_position[0] + cell[0] * grid_size,
+                 map_position[1] + cell[1] * grid_size,
+                 grid_size, grid_size),
+            )
+
+
 # Main loop state
 running = True
 path_found = False  # True once a route has been found
@@ -265,6 +300,14 @@ ROUTE_COLOR_SPEED = (0, 120, 255)
 ROUTE_COLOR_FUEL = (0, 200, 80)
 ROUTE_COLOR_SAFE = (255, 200, 0)
 _ROUTE_COLORS = {"speed": ROUTE_COLOR_SPEED, "fuel": ROUTE_COLOR_FUEL, "safe": ROUTE_COLOR_SAFE}
+
+# --- Historical date-diff state (Phase 2C-3) ---
+_date_diff_results = {}        # {'a': {'date':..., 'path':..., 'stats':...}, 'b': {...}}
+_date_diff_active = False      # True → draw both dated routes + diff panel instead of single/compare-mode
+date_diff_button_clicked = False
+
+ROUTE_COLOR_DATE_A = (0, 200, 255)   # cyan
+ROUTE_COLOR_DATE_B = (255, 120, 0)   # orange
 
 
 def _astar_thread_worker(params: RouteParams, result_queue: queue.Queue):
@@ -384,6 +427,8 @@ while running:
                 _compare_mode_active = False
                 _selected_route_key = 'speed'
                 _comparison_header_rects = {}
+                _date_diff_results = {}
+                _date_diff_active = False
                 path_found = False
                 exploration_done = False
                 start_button_clicked = False
@@ -413,6 +458,13 @@ while running:
 
             if ui_elements.draw_fuel_estimation_button(screen).collidepoint(event.pos):
                 _show_fuel_detail = not _show_fuel_detail  # toggle
+
+            # --- Date selector arrows / Compare Dates button (Phase 2C) ---
+            if ui_elements.handle_date_selector_click(event):
+                pass  # consumed — cycled a date arrow
+            elif ui_elements.draw_date_selectors(screen).collidepoint(event.pos):
+                date_diff_button_clicked = True
+                exploration_done = False
 
             # --- Comparison panel column clicks (uses last-drawn header rects) ---
             if _compare_mode_active:
@@ -479,6 +531,7 @@ while running:
             exploration_done = True
             path_found = True
             _compare_mode_active = False
+            _date_diff_active = False
             _current_path = msg["path"]
             _route_stats = msg.get("stats", {})
 
@@ -501,6 +554,7 @@ while running:
             exploration_done = True
             path_found = False
             _compare_mode_active = True
+            _date_diff_active = False
             _multi_routes = msg["results"]
             _selected_route_key = 'speed'
 
@@ -508,6 +562,19 @@ while running:
                 set_status("Comparison ready — click a column to highlight that route")
             else:
                 set_status("No route found for any mode")
+
+        elif msg["type"] == "date_diff_done":
+            _is_searching = False
+            exploration_done = True
+            path_found = False
+            _compare_mode_active = False
+            _date_diff_active = True
+            _date_diff_results = msg["results"]
+
+            if any(r.get("path") for r in _date_diff_results.values()):
+                set_status("Date comparison ready — cyan = Date A, orange = Date B")
+            else:
+                set_status("No route found for either date")
 
         elif msg["type"] == "error":
             _is_searching = False
@@ -532,6 +599,8 @@ while running:
 
     if _compare_mode_active:
         _draw_multi_routes(screen)
+    elif _date_diff_active:
+        _draw_date_diff_routes(screen)
     elif _current_path:
         for cell in _current_path:
             pygame.draw.rect(
@@ -558,6 +627,7 @@ while running:
     ui_elements.draw_dim_boxes(screen)
     ui_elements.draw_reset_button(screen)
     ui_elements.draw_compare_routes_button(screen, _compare_mode_active)
+    ui_elements.draw_date_selectors(screen)
 
     # Draw the "Calculate" button
     ui_elements.draw_start_button(screen)
@@ -623,6 +693,17 @@ while running:
             else:
                 mode = _get_individual_mode()
 
+            # Phase 2C-1/2C-2: if a historical date is selected (not "Default
+            # (PKL)"), swap in that day's snapshot heuristic instead of the
+            # trained PKL for this calculation.
+            heuristic_override = None
+            if ui_elements.date_selection != -1:
+                _dates = snapshot_heuristics.list_available_dates()
+                if ui_elements.date_selection < len(_dates):
+                    heuristic_override = snapshot_heuristics.load_snapshot_heuristic(
+                        _dates[ui_elements.date_selection]
+                    )
+
             params = RouteParams(
                 start=start,
                 end=end,
@@ -631,6 +712,7 @@ while running:
                 depth_grid=DEPTH_GRID,
                 ship_size_factor=get_ship_size_factor(),
                 min_depth=get_min_depth_for_vessel(),
+                heuristic_override=heuristic_override,
             )
 
             # Clear previous results
@@ -640,6 +722,8 @@ while running:
             _route_explanation = ""
             _multi_routes = {}
             _compare_mode_active = False
+            _date_diff_results = {}
+            _date_diff_active = False
             path_found = False
             exploration_done = False
             _is_searching = True
@@ -712,6 +796,8 @@ while running:
             _route_explanation = ""
             _multi_routes = {}
             _compare_mode_active = False
+            _date_diff_results = {}
+            _date_diff_active = False
             path_found = False
             exploration_done = False
             _is_searching = True
@@ -725,11 +811,97 @@ while running:
             )
             _route_thread.start()
 
-    # Draw comparison panel (multi-route) or single-route panel + explanation
+    # -----------------------------------------------------------------------
+    # Launch historical date-diff comparison (Phase 2C-3) when Compare Dates clicked
+    # -----------------------------------------------------------------------
+    if date_diff_button_clicked and not exploration_done and not _is_searching:
+        date_diff_button_clicked = False  # consume the click
+
+        available_dates = snapshot_heuristics.list_available_dates()
+        date_a_idx, date_b_idx = ui_elements.date_selection, ui_elements.date_b_selection
+
+        if not available_dates:
+            set_status("No historical snapshots found under data/snapshots/split_by_date/")
+        elif date_a_idx == -1 or date_b_idx == -1:
+            set_status("Pick two historical dates (not 'Default (PKL)') to compare")
+        else:
+            date_a = available_dates[date_a_idx]
+            date_b = available_dates[date_b_idx]
+
+            coords_ok = False
+            try:
+                if all(ui_elements.input_boxes):
+                    start_longitude = float(ui_elements.input_boxes[0])
+                    start_latitude = float(ui_elements.input_boxes[1])
+                    end_longitude = float(ui_elements.input_boxes[2])
+                    end_latitude = float(ui_elements.input_boxes[3])
+                    start = (longitude_to_grid(start_longitude), latitude_to_grid(start_latitude))
+                    end = (longitude_to_grid(end_longitude), latitude_to_grid(end_latitude))
+                    if (0 <= start[0] < grid_width and 0 <= start[1] < grid_height and
+                            0 <= end[0] < grid_width and 0 <= end[1] < grid_height):
+                        start_x = start_longitude
+                        start_y = start_latitude
+                        end_x = end_longitude
+                        end_y = end_latitude
+                        coords_ok = True
+                    else:
+                        set_status("Invalid start or end coordinates")
+                elif selected_start is not None and selected_end is not None:
+                    start = selected_start
+                    end = selected_end
+                    start_y = grid_to_latitude(start[1])
+                    start_x = grid_to_longitude(start[0])
+                    end_y = grid_to_latitude(end[1])
+                    end_x = grid_to_longitude(end[0])
+                    coords_ok = True
+                else:
+                    set_status("Please select start and end points")
+
+            except ValueError:
+                set_status("Please enter valid numbers for coordinates")
+
+            if coords_ok:
+                mode = "cargo" if cargo else ("passenger" if passenger else _get_individual_mode())
+
+                params_base = RouteParams(
+                    start=start,
+                    end=end,
+                    mode=mode,
+                    land_cells=LAND_CELLS,
+                    depth_grid=DEPTH_GRID,
+                    ship_size_factor=get_ship_size_factor(),
+                    min_depth=get_min_depth_for_vessel(),
+                )
+
+                # Clear previous results
+                _explored_cells.clear()
+                _current_path = None
+                _route_stats = {}
+                _route_explanation = ""
+                _multi_routes = {}
+                _compare_mode_active = False
+                _date_diff_results = {}
+                _date_diff_active = False
+                path_found = False
+                exploration_done = False
+                _is_searching = True
+
+                set_status(f"Comparing {date_a} vs {date_b}...")
+
+                _route_thread = threading.Thread(
+                    target=_date_diff_thread_worker,
+                    args=(params_base, date_a, date_b, _route_queue),
+                    daemon=True,
+                )
+                _route_thread.start()
+
+    # Draw comparison panel (multi-route), date-diff panel, or single-route panel + explanation
     if _compare_mode_active and _multi_routes:
         _comparison_header_rects = route_panel.draw_comparison_panel(
             screen, _multi_routes, _selected_route_key
         )
+    elif _date_diff_active and _date_diff_results:
+        route_panel.draw_date_diff_panel(screen, _date_diff_results)
     elif path_found and _route_stats:
         current_mode = "cargo" if cargo else ("passenger" if passenger else _get_individual_mode())
         route_panel.draw_route_panel(screen, _route_stats, current_mode)
