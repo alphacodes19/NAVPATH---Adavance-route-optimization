@@ -4,6 +4,7 @@ from pathlib import Path
 import pygame
 
 from src.data.ports import PORTS
+from src.data.vessels import VESSELS
 from src.engine.snapshot_heuristics import list_available_dates
 
 # --- Font loading -----------------------------------------------------
@@ -95,6 +96,21 @@ _DATE_SEL_H = 30
 _DATE_ARROW_W = 30
 _DATE_NAME_W = 220
 _DATE_DIFF_BTN_RECT = pygame.Rect(670, 465, 580, 34)
+
+# --- Vessel profile selector (Phase 2D-2) ----------------------------------
+# One arrow-selector that auto-fills the existing L/B/H/Eff ship-dimension
+# boxes (draw_dim_boxes() below) from src/data/vessels.py. Placed to the
+# right of those boxes/the date-selector panel, in open screen space, since
+# that whole 670-1230 column is already packed with the coordinate inputs,
+# mode buttons, and date selectors.
+vessel_selection = -1  # index into VESSELS; -1 = Manual (boxes left as typed)
+
+_VESSEL_SEL_X = 1250
+_VESSEL_SEL_Y_TITLE = 405
+_VESSEL_SEL_Y = 420
+_VESSEL_ARROW_W = 30
+_VESSEL_SEL_H = 34
+_VESSEL_NAME_W = 220
 
 
 # Function to draw gradient-filled rounded rectangles
@@ -317,6 +333,87 @@ def draw_dim_boxes(screen):
         text_x = box_x + (input_box_width - text.get_width()) // 2
         text_y = box_y + (input_box_height - text.get_height()) // 2
         screen.blit(text, (text_x, text_y))
+
+
+def _vessel_label(index: int) -> str:
+    return "Manual" if index == -1 else VESSELS[index]["name"]
+
+
+def draw_vessel_selector(screen):
+    """
+    Draw the "Vessel Profile" arrow-selector. Always visible, same as
+    draw_dim_boxes() — not gated behind show_input_boxes.
+    """
+    font = get_font(20, bold=True)
+    title_font = get_font(16)
+
+    title_text = title_font.render("Vessel Profile", True, (180, 180, 180))
+    screen.blit(title_text, (_VESSEL_SEL_X, _VESSEL_SEL_Y_TITLE))
+
+    left_rect = pygame.Rect(_VESSEL_SEL_X, _VESSEL_SEL_Y, _VESSEL_ARROW_W, _VESSEL_SEL_H)
+    name_rect = pygame.Rect(_VESSEL_SEL_X + _VESSEL_ARROW_W, _VESSEL_SEL_Y,
+                             _VESSEL_NAME_W, _VESSEL_SEL_H)
+    right_rect = pygame.Rect(_VESSEL_SEL_X + _VESSEL_ARROW_W + _VESSEL_NAME_W, _VESSEL_SEL_Y,
+                              _VESSEL_ARROW_W, _VESSEL_SEL_H)
+
+    pygame.draw.rect(screen, (40, 60, 90), name_rect, border_radius=4)
+    pygame.draw.rect(screen, BUTTON_BORDER_COLOR, name_rect, width=1, border_radius=4)
+    for rect in (left_rect, right_rect):
+        pygame.draw.rect(screen, (60, 90, 130), rect, border_radius=4)
+
+    pygame.draw.polygon(screen, WHITE, [
+        (left_rect.centerx + 4, left_rect.centery - 7),
+        (left_rect.centerx + 4, left_rect.centery + 7),
+        (left_rect.centerx - 5, left_rect.centery),
+    ])
+    pygame.draw.polygon(screen, WHITE, [
+        (right_rect.centerx - 4, right_rect.centery - 7),
+        (right_rect.centerx - 4, right_rect.centery + 7),
+        (right_rect.centerx + 5, right_rect.centery),
+    ])
+
+    label = font.render(_vessel_label(vessel_selection), True, WHITE)
+    screen.blit(label, (name_rect.centerx - label.get_width() // 2,
+                         name_rect.centery - label.get_height() // 2))
+
+
+def _apply_vessel_selection():
+    """
+    Auto-fill the L/B/H/Eff boxes (button_values) from the selected
+    vessel. "H" is filled with the vessel's draft — main.py already treats
+    that box as a draft proxy (get_min_depth_for_vessel()), and the new
+    hard-forbidden-cell filtering (router.get_neighbors(), Phase 2D-3)
+    reads the same box via main.py's get_vessel_draft().
+    """
+    if vessel_selection == -1:
+        return  # Manual — leave whatever is already typed there
+    vessel = VESSELS[vessel_selection]
+    button_values[0] = str(vessel["L"])
+    button_values[1] = str(vessel["B"])
+    button_values[2] = str(vessel["draft"])
+    button_values[3] = str(vessel["eff"])
+
+
+def handle_vessel_selector_click(event) -> bool:
+    """
+    Handle a MOUSEBUTTONDOWN on the vessel-selector arrows.
+    Returns True if the click was consumed by an arrow.
+    """
+    global vessel_selection
+
+    left_rect = pygame.Rect(_VESSEL_SEL_X, _VESSEL_SEL_Y, _VESSEL_ARROW_W, _VESSEL_SEL_H)
+    right_rect = pygame.Rect(_VESSEL_SEL_X + _VESSEL_ARROW_W + _VESSEL_NAME_W, _VESSEL_SEL_Y,
+                              _VESSEL_ARROW_W, _VESSEL_SEL_H)
+
+    if left_rect.collidepoint(event.pos):
+        vessel_selection = vessel_selection - 1 if vessel_selection > -1 else len(VESSELS) - 1
+        _apply_vessel_selection()
+        return True
+    if right_rect.collidepoint(event.pos):
+        vessel_selection = vessel_selection + 1 if vessel_selection < len(VESSELS) - 1 else -1
+        _apply_vessel_selection()
+        return True
+    return False
 
 
 def draw_new_input_boxes(screen):

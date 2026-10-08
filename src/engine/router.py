@@ -64,6 +64,7 @@ class RouteParams:
         ship_size_factor: float = 1.0,
         min_depth: float = -10.0,
         heuristic_override: dict = None,
+        draft: float = None,
     ):
         self.start = start
         self.end = end
@@ -76,6 +77,13 @@ class RouteParams:
         # {(lon, lat): float} dict (one day's weather snapshot) instead
         # of the trained heuristics_data.pkl — see snapshot_heuristics.py.
         self.heuristic_override = heuristic_override
+        # Phase 2D-3: the selected vessel's draft in metres (positive number,
+        # e.g. 8 for an 8m-draft cargo ship). When set, get_neighbors() hard-
+        # excludes any cell shallower than draft + 2.0m safety margin, instead
+        # of only soft-penalising it via min_depth/_depth_penalty below. None
+        # (no vessel selected / Manual) keeps the old soft-penalty-only
+        # behaviour unchanged.
+        self.draft = draft
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +196,9 @@ def calculate_fscore(
 # ---------------------------------------------------------------------------
 # Neighbour generation
 # ---------------------------------------------------------------------------
+DRAFT_SAFETY_MARGIN_M = 2.0  # same margin get_min_depth_for_vessel() already assumes
+
+
 def get_neighbors(pos: tuple, params: RouteParams):
     """
     Returns list of (neighbor_cell, wind_align, current_align) for all
@@ -203,6 +214,15 @@ def get_neighbors(pos: tuple, params: RouteParams):
             continue
         if (nx, ny) in storage.Backup_black_cells:
             continue
+        if params.draft is not None:
+            # Phase 2D-3: hard-forbid cells too shallow for this vessel's
+            # draft, rather than merely penalising them in the f-score.
+            # Only enforced where depth data actually exists — a cell with
+            # no DEPTH_GRID entry is left to the existing soft-penalty path
+            # (same "no data -> no opinion" convention as _depth_penalty()).
+            depth = params.depth_grid.get((nx, ny))
+            if depth is not None and depth > -(params.draft + DRAFT_SAFETY_MARGIN_M):
+                continue
         wa = _wind_alignment(nx, ny, dx, dy)
         ca = _current_alignment(nx, ny, dx, dy)
         results.append(((nx, ny), wa, ca))

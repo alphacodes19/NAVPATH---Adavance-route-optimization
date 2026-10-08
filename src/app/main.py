@@ -188,6 +188,26 @@ def get_min_depth_for_vessel():
     return MIN_SAFE_DEPTH
 
 
+def get_vessel_draft():
+    """
+    Raw draft value (metres) from the H box, for the hard forbidden-cell
+    filtering added in router.get_neighbors() (Phase 2D-3). Distinct from
+    get_min_depth_for_vessel() above, which already folds the same +2m
+    margin into a *soft* f-score penalty (min_depth) — this instead feeds
+    RouteParams.draft, which get_neighbors() uses to exclude cells
+    outright. Returns None when the box is blank/invalid, matching
+    get_min_depth_for_vessel()'s own fallback (no vessel entered -> no
+    hard filtering, same as before Phase 2D).
+    """
+    try:
+        height = float(ui_elements.button_values[2])
+        if height > 0:
+            return height
+    except (ValueError, IndexError):
+        pass
+    return None
+
+
 def _get_individual_mode():
     """Read Fuel/Speed/Comfort button state and return mode string."""
     if ui_elements.horizontal_buttons[0]:
@@ -474,8 +494,11 @@ while running:
                         break
 
             # --- Port selector arrows (only live while input boxes are shown) ---
+            # --- Vessel selector arrows (always live, like the dim boxes themselves) ---
             if show_input_boxes and ui_elements.handle_port_selector_click(event):
                 pass  # consumed — skip the coordinate-box hit-testing below
+            elif ui_elements.handle_vessel_selector_click(event):
+                pass  # consumed — cycled a vessel arrow
             else:
                 ui_elements.handle_mouse_click(event)
 
@@ -625,6 +648,7 @@ while running:
     ui_elements.draw_retrain_model_button(screen)
     ui_elements.draw_path_coordinates_button(screen)
     ui_elements.draw_dim_boxes(screen)
+    ui_elements.draw_vessel_selector(screen)
     ui_elements.draw_reset_button(screen)
     ui_elements.draw_compare_routes_button(screen, _compare_mode_active)
     ui_elements.draw_date_selectors(screen)
@@ -713,6 +737,7 @@ while running:
                 ship_size_factor=get_ship_size_factor(),
                 min_depth=get_min_depth_for_vessel(),
                 heuristic_override=heuristic_override,
+                draft=get_vessel_draft(),
             )
 
             # Clear previous results
@@ -787,6 +812,7 @@ while running:
                 depth_grid=DEPTH_GRID,
                 ship_size_factor=get_ship_size_factor(),
                 min_depth=get_min_depth_for_vessel(),
+                draft=get_vessel_draft(),
             )
 
             # Clear previous results
@@ -871,6 +897,7 @@ while running:
                     depth_grid=DEPTH_GRID,
                     ship_size_factor=get_ship_size_factor(),
                     min_depth=get_min_depth_for_vessel(),
+                    draft=get_vessel_draft(),
                 )
 
                 # Clear previous results
