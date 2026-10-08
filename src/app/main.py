@@ -24,7 +24,9 @@ from src.engine.coord_convert import (
 from src.engine import storage  # For the map boundary
 from src.engine import depth_cells
 from src.engine import router as route_engine
-from src.engine.router import RouteParams, run_astar, compute_route_stats, explain_route
+from src.engine.router import (
+    RouteParams, run_astar, run_multi_route, compute_route_stats, explain_route,
+)
 from src.engine.exporter import export_csv, export_gpx
 
 clock = pygame.time.Clock()
@@ -207,6 +209,7 @@ running = True
 path_found = False  # True once a route has been found
 show_input_boxes = False  # Flag to control input box visibility
 start_button_clicked = False  # Flag to check if the start button is clicked
+compare_button_clicked = False  # Flag to check if the Compare Routes button is clicked
 exploration_done = False  # Flag to prevent multiple explorations
 selected_start = None  # To store the start point : interactive click
 selected_end = None  # To store the end point : interactive click
@@ -246,11 +249,22 @@ def draw_status_message(screen):
 _route_queue = queue.Queue()   # communication channel from A* thread to main thread
 _route_thread = None           # reference to the running thread (None when idle)
 _is_searching = False          # True while A* thread is alive
-_current_path = None           # the last successfully found path
+_current_path = None           # the last successfully found path (single-route mode)
 _explored_cells = []           # cells to draw red (accumulated from queue)
 _route_stats = {}              # stats dict returned by compute_route_stats()
 _route_explanation = ""        # human-readable summary of the last route
 _show_fuel_detail = False      # whether the fuel-estimation overlay is open
+
+# --- Multi-route comparison state (Phase 2A) ---
+_multi_routes = {}             # {'speed': {'path':[], 'stats':{}}, 'fuel':..., 'safe':...}
+_selected_route_key = 'speed'  # which comparison route is highlighted / bold on the map
+_compare_mode_active = False   # True → draw comparison panel + 3 paths instead of single-route panel
+_comparison_header_rects = {}  # last-drawn column rects from draw_comparison_panel(), for click hit-testing
+
+ROUTE_COLOR_SPEED = (0, 120, 255)
+ROUTE_COLOR_FUEL = (0, 200, 80)
+ROUTE_COLOR_SAFE = (255, 200, 0)
+_ROUTE_COLORS = {"speed": ROUTE_COLOR_SPEED, "fuel": ROUTE_COLOR_FUEL, "safe": ROUTE_COLOR_SAFE}
 
 
 def _astar_thread_worker(params: RouteParams, result_queue: queue.Queue):
@@ -285,6 +299,60 @@ def _astar_thread_worker(params: RouteParams, result_queue: queue.Queue):
         result_queue.put({"type": "error", "msg": str(e)})
 
 
+def _multi_route_thread_worker(params_base: RouteParams, result_queue: queue.Queue):
+    """
+    Runs run_multi_route() (speed/fuel/safe) on a background thread.
+    Never touches pygame directly. Explored-cell progress from all three
+    runs is merged into one shared callback — see run_multi_route()'s
+    docstring if per-mode progress bars are wanted later.
+    """
+    def on_cell_explored(cell):
+        result_queue.put({"type": "explored", "cell": cell})
+
+    try:
+        results = run_multi_route(params_base, progress_callback=on_cell_explored)
+        result_queue.put({"type": "multi_done", "results": results})
+    except Exception as e:
+        logging.exception("Multi-route thread failed")
+        result_queue.put({"type": "error", "msg": str(e)})
+
+
+def _draw_multi_routes(screen):
+    """
+    Draw all three comparison routes on the map. The non-selected routes
+    are drawn first at normal width, then the selected route is drawn
+    last (so it sits on top) brighter and 3px wide.
+    """
+    for key, data in _multi_routes.items():
+        if key == _selected_route_key:
+            continue
+        path = data.get("path")
+        if not path:
+            continue
+        color = _ROUTE_COLORS.get(key, WHITE)
+        for cell in path:
+            pygame.draw.rect(
+                screen, color,
+                (map_position[0] + cell[0] * grid_size,
+                 map_position[1] + cell[1] * grid_size,
+                 grid_size, grid_size),
+            )
+
+    selected = _multi_routes.get(_selected_route_key)
+    if selected and selected.get("path"):
+        color = _ROUTE_COLORS.get(_selected_route_key, WHITE)
+        bright = tuple(min(255, c + 60) for c in color)
+        width = grid_size * 3
+        offset = (width - grid_size) // 2
+        for cell in selected["path"]:
+            pygame.draw.rect(
+                screen, bright,
+                (map_position[0] + cell[0] * grid_size - offset,
+                 map_position[1] + cell[1] * grid_size - offset,
+                 width, width),
+            )
+
+
 while running:
     for event in pygame.event.get():
         if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE):
@@ -299,6 +367,10 @@ while running:
                 start_button_clicked = True
                 exploration_done = False
 
+            if ui_elements.draw_compare_routes_button(screen, _compare_mode_active).collidepoint(event.pos):
+                compare_button_clicked = True
+                exploration_done = False
+
             if ui_elements.draw_reset_button(screen).collidepoint(event.pos):
                 # Reset all route state
                 selected_start = None
@@ -308,9 +380,14 @@ while running:
                 _route_stats = {}
                 _route_explanation = ""
                 _show_fuel_detail = False
+                _multi_routes = {}
+                _compare_mode_active = False
+                _selected_route_key = 'speed'
+                _comparison_header_rects = {}
                 path_found = False
                 exploration_done = False
                 start_button_clicked = False
+                compare_button_clicked = False
                 _is_searching = False
                 background()
                 drawGrid()
@@ -337,7 +414,18 @@ while running:
             if ui_elements.draw_fuel_estimation_button(screen).collidepoint(event.pos):
                 _show_fuel_detail = not _show_fuel_detail  # toggle
 
-            ui_elements.handle_mouse_click(event)
+            # --- Comparison panel column clicks (uses last-drawn header rects) ---
+            if _compare_mode_active:
+                for key, rect in _comparison_header_rects.items():
+                    if rect.collidepoint(event.pos):
+                        _selected_route_key = key
+                        break
+
+            # --- Port selector arrows (only live while input boxes are shown) ---
+            if show_input_boxes and ui_elements.handle_port_selector_click(event):
+                pass  # consumed — skip the coordinate-box hit-testing below
+            else:
+                ui_elements.handle_mouse_click(event)
 
             # --- Map clicks ---
             mouse_x, mouse_y = event.pos
@@ -364,7 +452,18 @@ while running:
             ui_elements.handle_dir_input(event)
 
     # -----------------------------------------------------------------------
-    # Drain the route queue — process messages from the A* thread
+    # Drain the route queue — process messages from the A*/multi-route thread
+    #
+    # NOTE: this section only updates *state* now. All drawing of the path,
+    # explored cells, and comparison routes happens once per frame in the
+    # persistent render section below (after background()/drawGrid()).
+    # Previously the final path/explored cells were drawn here directly,
+    # but every frame — including this same one — the unconditional
+    # `screen.blit(background_image, ...); background(); drawGrid()` call
+    # further down ran *after* this and immediately erased them, so the
+    # route never stayed visible. Driving the drawing from state instead
+    # of from the arrival of a queue message fixes that for both
+    # single-route and multi-route (comparison) results.
     # -----------------------------------------------------------------------
     while not _route_queue.empty():
         try:
@@ -373,41 +472,15 @@ while running:
             break
 
         if msg["type"] == "explored":
-            cell = msg["cell"]
-            _explored_cells.append(cell)
-            # Draw explored cell immediately in red
-            pygame.draw.rect(
-                screen, RED,
-                (map_position[0] + cell[0] * grid_size,
-                 map_position[1] + cell[1] * grid_size,
-                 grid_size, grid_size),
-            )
+            _explored_cells.append(msg["cell"])
 
         elif msg["type"] == "done":
             _is_searching = False
             exploration_done = True
             path_found = True
+            _compare_mode_active = False
             _current_path = msg["path"]
             _route_stats = msg.get("stats", {})
-
-            # Draw the final path in green
-            background()
-            drawGrid()
-            # Redraw explored nodes so they show under the path
-            for cell in _explored_cells:
-                pygame.draw.rect(
-                    screen, RED,
-                    (map_position[0] + cell[0] * grid_size,
-                     map_position[1] + cell[1] * grid_size,
-                     grid_size, grid_size),
-                )
-            for cell in _current_path:
-                pygame.draw.rect(
-                    screen, GREEN,
-                    (map_position[0] + cell[0] * grid_size,
-                     map_position[1] + cell[1] * grid_size,
-                     grid_size, grid_size),
-                )
 
             dist = _route_stats.get("distance_nm", "?")
             depth = _route_stats.get("min_depth_m", "?")
@@ -423,6 +496,19 @@ while running:
             )
             logging.info(f"Route explanation: {_route_explanation}")
 
+        elif msg["type"] == "multi_done":
+            _is_searching = False
+            exploration_done = True
+            path_found = False
+            _compare_mode_active = True
+            _multi_routes = msg["results"]
+            _selected_route_key = 'speed'
+
+            if any(r.get("path") for r in _multi_routes.values()):
+                set_status("Comparison ready — click a column to highlight that route")
+            else:
+                set_status("No route found for any mode")
+
         elif msg["type"] == "error":
             _is_searching = False
             exploration_done = True
@@ -434,6 +520,26 @@ while running:
     background()
     drawGrid()
     # foreground() no longer drawn here — see build_land_mask() above.
+
+    # --- Persistent route drawing (driven by state, not by queue arrival) ---
+    for cell in _explored_cells:
+        pygame.draw.rect(
+            screen, RED,
+            (map_position[0] + cell[0] * grid_size,
+             map_position[1] + cell[1] * grid_size,
+             grid_size, grid_size),
+        )
+
+    if _compare_mode_active:
+        _draw_multi_routes(screen)
+    elif _current_path:
+        for cell in _current_path:
+            pygame.draw.rect(
+                screen, GREEN,
+                (map_position[0] + cell[0] * grid_size,
+                 map_position[1] + cell[1] * grid_size,
+                 grid_size, grid_size),
+            )
 
     if start_x and start_y:
         weather_display.weather(screen, start_y, start_x)
@@ -451,6 +557,7 @@ while running:
     ui_elements.draw_path_coordinates_button(screen)
     ui_elements.draw_dim_boxes(screen)
     ui_elements.draw_reset_button(screen)
+    ui_elements.draw_compare_routes_button(screen, _compare_mode_active)
 
     # Draw the "Calculate" button
     ui_elements.draw_start_button(screen)
@@ -460,6 +567,7 @@ while running:
 
     # Display input boxes if show_input_boxes is active
     if show_input_boxes:
+        ui_elements.draw_port_selectors(screen)
         ui_elements.draw_input_boxes(screen)
 
     ui_elements.draw_new_input_boxes(screen)
@@ -468,7 +576,7 @@ while running:
     cargo, passenger = ui_elements.new_input_boxes[0], ui_elements.new_input_boxes[1]
 
     # -----------------------------------------------------------------------
-    # Launch A* in a background thread when Calculate is clicked
+    # Launch A* (single route) in a background thread when Calculate is clicked
     # -----------------------------------------------------------------------
     if start_button_clicked and not exploration_done and not _is_searching:
         start_button_clicked = False  # consume the click
@@ -530,6 +638,8 @@ while running:
             _current_path = None
             _route_stats = {}
             _route_explanation = ""
+            _multi_routes = {}
+            _compare_mode_active = False
             path_found = False
             exploration_done = False
             _is_searching = True
@@ -544,12 +654,87 @@ while running:
             )
             _route_thread.start()
 
-    # Draw route panel + explanation if a route has been found
-    if path_found and _route_stats:
+    # -----------------------------------------------------------------------
+    # Launch multi-route comparison (speed/fuel/safe) when Compare Routes is clicked
+    # -----------------------------------------------------------------------
+    if compare_button_clicked and not exploration_done and not _is_searching:
+        compare_button_clicked = False  # consume the click
+
+        coords_ok = False
+        try:
+            if all(ui_elements.input_boxes):
+                start_longitude = float(ui_elements.input_boxes[0])
+                start_latitude = float(ui_elements.input_boxes[1])
+                end_longitude = float(ui_elements.input_boxes[2])
+                end_latitude = float(ui_elements.input_boxes[3])
+                start = (longitude_to_grid(start_longitude), latitude_to_grid(start_latitude))
+                end = (longitude_to_grid(end_longitude), latitude_to_grid(end_latitude))
+                if (0 <= start[0] < grid_width and 0 <= start[1] < grid_height and
+                        0 <= end[0] < grid_width and 0 <= end[1] < grid_height):
+                    start_x = start_longitude
+                    start_y = start_latitude
+                    end_x = end_longitude
+                    end_y = end_latitude
+                    coords_ok = True
+                else:
+                    set_status("Invalid start or end coordinates")
+            elif selected_start is not None and selected_end is not None:
+                start = selected_start
+                end = selected_end
+                start_y = grid_to_latitude(start[1])
+                start_x = grid_to_longitude(start[0])
+                end_y = grid_to_latitude(end[1])
+                end_x = grid_to_longitude(end[0])
+                coords_ok = True
+            else:
+                set_status("Please select start and end points")
+
+        except ValueError:
+            set_status("Please enter valid numbers for coordinates")
+
+        if coords_ok:
+            # mode is overridden per-key inside run_multi_route(); "speed" here
+            # is just a placeholder so RouteParams has a valid default.
+            params_base = RouteParams(
+                start=start,
+                end=end,
+                mode="speed",
+                land_cells=LAND_CELLS,
+                depth_grid=DEPTH_GRID,
+                ship_size_factor=get_ship_size_factor(),
+                min_depth=get_min_depth_for_vessel(),
+            )
+
+            # Clear previous results
+            _explored_cells.clear()
+            _current_path = None
+            _route_stats = {}
+            _route_explanation = ""
+            _multi_routes = {}
+            _compare_mode_active = False
+            path_found = False
+            exploration_done = False
+            _is_searching = True
+
+            set_status("Comparing speed / fuel / safe routes...")
+
+            _route_thread = threading.Thread(
+                target=_multi_route_thread_worker,
+                args=(params_base, _route_queue),
+                daemon=True,
+            )
+            _route_thread.start()
+
+    # Draw comparison panel (multi-route) or single-route panel + explanation
+    if _compare_mode_active and _multi_routes:
+        _comparison_header_rects = route_panel.draw_comparison_panel(
+            screen, _multi_routes, _selected_route_key
+        )
+    elif path_found and _route_stats:
         current_mode = "cargo" if cargo else ("passenger" if passenger else _get_individual_mode())
         route_panel.draw_route_panel(screen, _route_stats, current_mode)
 
-    if path_found and _route_explanation:
+    if path_found and _route_explanation and not _compare_mode_active:
         font_exp = ui_elements.get_font(22)
         # Word-wrap to fit panel width (560px)
         words = _route_explanation.split()

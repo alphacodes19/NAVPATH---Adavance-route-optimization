@@ -3,6 +3,8 @@ from pathlib import Path
 
 import pygame
 
+from src.data.ports import PORTS
+
 # --- Font loading -----------------------------------------------------
 # Roboto, loaded once per size and cached, instead of the scattered
 # pygame.font.Font(None, size) bitmap-default calls used everywhere before.
@@ -65,6 +67,19 @@ _MODE_START_X, _MODE_START_Y = 833, 300
 _SUB_BTN_H = 36
 _SUB_Y = _MODE_START_Y + 70
 
+# --- Port selector (Phase 2B) ---------------------------------------------
+# Two arrow-selectors sitting above the Departure/Destination coordinate
+# columns (input_boxes_position below). Cycling to a port auto-fills the
+# matching lon/lat input boxes; cycling back to "Manual" (-1) leaves
+# whatever is already typed there alone, so manual entry still works.
+port_selection = [-1, -1]  # [departure_index, destination_index] into PORTS; -1 = Manual
+
+_PORT_SEL_X = [670, 910]   # aligned with the Departure / Destination input-box columns
+_PORT_SEL_Y = 25
+_PORT_ARROW_W = 30
+_PORT_ARROW_H = 34
+_PORT_NAME_W = 220
+
 
 # Function to draw gradient-filled rounded rectangles
 def draw_gradient_button(screen, rect, color_top, color_bottom, border_radius=12):
@@ -93,6 +108,81 @@ def draw_input_boxes(screen):
                           (pos[0] + 150, pos[1] - 10, input_box_width, input_box_height), 2)
         text = font.render(input_boxes[i], True, WHITE)
         screen.blit(text, (pos[0] + 155, pos[1] - 3))
+
+
+def _port_label(index: int) -> str:
+    return "Manual" if index == -1 else PORTS[index]["name"]
+
+
+def draw_port_selectors(screen):
+    """
+    Draw the Departure/Destination port arrow-selectors. Only meaningful
+    while the coordinate input boxes are visible, same as draw_input_boxes().
+    """
+    font = get_font(22, bold=True)
+    label_font = get_font(16)
+    titles = ["Departure Port", "Destination Port"]
+
+    for col, x in enumerate(_PORT_SEL_X):
+        title_text = label_font.render(titles[col], True, (180, 180, 180))
+        screen.blit(title_text, (x, _PORT_SEL_Y - 16))
+
+        left_rect = pygame.Rect(x, _PORT_SEL_Y, _PORT_ARROW_W, _PORT_ARROW_H)
+        name_rect = pygame.Rect(x + _PORT_ARROW_W, _PORT_SEL_Y, _PORT_NAME_W, _PORT_ARROW_H)
+        right_rect = pygame.Rect(x + _PORT_ARROW_W + _PORT_NAME_W, _PORT_SEL_Y,
+                                  _PORT_ARROW_W, _PORT_ARROW_H)
+
+        pygame.draw.rect(screen, (40, 60, 90), name_rect, border_radius=4)
+        pygame.draw.rect(screen, BUTTON_BORDER_COLOR, name_rect, width=1, border_radius=4)
+        for rect in (left_rect, right_rect):
+            pygame.draw.rect(screen, (60, 90, 130), rect, border_radius=4)
+
+        pygame.draw.polygon(screen, WHITE, [
+            (left_rect.centerx + 5, left_rect.centery - 8),
+            (left_rect.centerx + 5, left_rect.centery + 8),
+            (left_rect.centerx - 6, left_rect.centery),
+        ])
+        pygame.draw.polygon(screen, WHITE, [
+            (right_rect.centerx - 5, right_rect.centery - 8),
+            (right_rect.centerx - 5, right_rect.centery + 8),
+            (right_rect.centerx + 6, right_rect.centery),
+        ])
+
+        label = font.render(_port_label(port_selection[col]), True, WHITE)
+        screen.blit(label, (name_rect.centerx - label.get_width() // 2,
+                             name_rect.centery - label.get_height() // 2))
+
+
+def _apply_port_selection(col: int):
+    """Auto-fill the lon/lat input boxes for column 0 (departure) or 1 (destination)."""
+    idx = port_selection[col]
+    if idx == -1:
+        return  # Manual — leave whatever is already typed there
+    port = PORTS[idx]
+    base = col * 2  # departure -> input_boxes[0:2], destination -> input_boxes[2:4]
+    input_boxes[base] = str(port["lon"])
+    input_boxes[base + 1] = str(port["lat"])
+
+
+def handle_port_selector_click(event) -> bool:
+    """
+    Handle a MOUSEBUTTONDOWN on the port-selector arrows.
+    Returns True if the click was consumed by an arrow.
+    """
+    for col, x in enumerate(_PORT_SEL_X):
+        left_rect = pygame.Rect(x, _PORT_SEL_Y, _PORT_ARROW_W, _PORT_ARROW_H)
+        right_rect = pygame.Rect(x + _PORT_ARROW_W + _PORT_NAME_W, _PORT_SEL_Y,
+                                  _PORT_ARROW_W, _PORT_ARROW_H)
+
+        if left_rect.collidepoint(event.pos):
+            port_selection[col] = port_selection[col] - 1 if port_selection[col] > -1 else len(PORTS) - 1
+            _apply_port_selection(col)
+            return True
+        if right_rect.collidepoint(event.pos):
+            port_selection[col] = port_selection[col] + 1 if port_selection[col] < len(PORTS) - 1 else -1
+            _apply_port_selection(col)
+            return True
+    return False
 
 
 def draw_dim_boxes(screen):
@@ -319,6 +409,26 @@ def draw_reset_button(screen):
     draw_gradient_button(screen, button_rect, (180, 60, 60), (140, 30, 30))
     font = get_font(28)
     text = font.render("Reset Route", True, BUTTON_TEXT_COLOR)
+    screen.blit(text, (button_rect.centerx - text.get_width() // 2,
+                        button_rect.centery - text.get_height() // 2))
+    return button_rect
+
+
+def draw_compare_routes_button(screen, is_active=False):
+    """
+    Trigger a 3-way (speed/fuel/safe) route comparison — see
+    router.run_multi_route(). Sits beside Reset Route, below Calculate.
+    """
+    button_rect = pygame.Rect(940, 270, 230, 45)
+    shadow_rect = button_rect.copy()
+    shadow_rect.topleft = (shadow_rect.x + 3, shadow_rect.y + 3)
+    pygame.draw.rect(screen, SHADOW_COLOR, shadow_rect, border_radius=8)
+    if is_active:
+        draw_gradient_button(screen, button_rect, (190, 110, 230), (140, 60, 180))
+    else:
+        draw_gradient_button(screen, button_rect, (140, 60, 180), (100, 30, 140))
+    font = get_font(24)
+    text = font.render("Compare Routes", True, BUTTON_TEXT_COLOR)
     screen.blit(text, (button_rect.centerx - text.get_width() // 2,
                         button_rect.centery - text.get_height() // 2))
     return button_rect

@@ -8,6 +8,7 @@ update the screen without this module ever importing pygame.
 
 import math
 import logging
+import copy
 from queue import PriorityQueue
 from typing import Callable, Optional
 
@@ -262,6 +263,52 @@ def run_astar(
 
     logging.warning(f"A* found no path from {start} to {end}")
     return None, explored
+
+
+# ---------------------------------------------------------------------------
+# Multi-route comparison (Phase 2A)
+# ---------------------------------------------------------------------------
+def run_multi_route(params_base: RouteParams, progress_callback: Optional[Callable] = None) -> dict:
+    """
+    Run A* three times from the same start/end — speed, fuel, and safe
+    modes — and return all three results for side-by-side comparison.
+
+    NOTE: there's no dedicated 'safe' entry in calculate_fscore() yet.
+    'safe' is mapped to the existing 'comfort' formula (heaviest
+    heuristic weight, lightest euclidean pull) as the closest stand-in
+    for a risk-averse route. Swap the mode_for_key mapping below if you'd
+    rather define a true 'safe' weighting (e.g. heavier depth_pen weighting)
+    instead of reusing comfort.
+
+    Returns:
+        {
+          'speed': {'path': [...] or None, 'stats': {...}},
+          'fuel':  {'path': [...] or None, 'stats': {...}},
+          'safe':  {'path': [...] or None, 'stats': {...}},
+        }
+    """
+    mode_for_key = {
+        "speed": "speed",
+        "fuel": "fuel",
+        "safe": "comfort",
+    }
+
+    results = {}
+    for key, mode in mode_for_key.items():
+        params = copy.copy(params_base)
+        params.mode = mode
+
+        path, explored = run_astar(params, progress_callback=progress_callback)
+
+        if path:
+            stats = compute_route_stats(path, params.depth_grid, _fuel_retriever._index)
+        else:
+            stats = {}
+            logging.warning(f"run_multi_route: no path found for mode '{mode}' (key '{key}')")
+
+        results[key] = {"path": path, "stats": stats}
+
+    return results
 
 
 # ---------------------------------------------------------------------------
