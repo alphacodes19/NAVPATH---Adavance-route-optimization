@@ -7,24 +7,23 @@ class HeuristicRetriever:
         # Store references to loaded files
         self.loaded_files = {}
 
-    # AFTER
-def load_file(self, filename):
-    if filename not in self.loaded_files:
-        try:
-            with open(filename, "rb") as f:
-                raw = pickle.load(f)
-            # The PKL is saved as {'heuristics': {(lon,lat): float}, 'wind_deviation': {...}}
-            # We only need the inner heuristics dict. Without this unwrap, every lookup
-            # searched the outer wrapper and always returned the default 0.5 — silencing
-            # the XGBoost model entirely.
-            if isinstance(raw, dict) and "heuristics" in raw:
-                self.loaded_files[filename] = raw["heuristics"]
-            else:
-                self.loaded_files[filename] = raw
-        except FileNotFoundError:
-            logging.warning(f"No saved data found at {filename}. Please ensure the file exists.")
-            self.loaded_files[filename] = {}
-    return self.loaded_files[filename]
+    def load_file(self, filename):
+        if filename not in self.loaded_files:
+            try:
+                with open(filename, "rb") as f:
+                    raw = pickle.load(f)
+                # The PKL is saved as {'heuristics': {(lon,lat): float}, 'wind_deviation': {...}}
+                # We only need the inner heuristics dict. Without this unwrap, every lookup
+                # searched the outer wrapper and always returned the default 0.5 — silencing
+                # the XGBoost model entirely.
+                if isinstance(raw, dict) and "heuristics" in raw:
+                    self.loaded_files[filename] = raw["heuristics"]
+                else:
+                    self.loaded_files[filename] = raw
+            except FileNotFoundError:
+                logging.warning(f"No saved data found at {filename}. Please ensure the file exists.")
+                self.loaded_files[filename] = {}
+        return self.loaded_files[filename]
 
     def get_heuristic_value(self, latitude, longitude, filename):
         """
@@ -45,5 +44,5 @@ def load_file(self, filename):
         if coordinate in data:
             return data[coordinate]
         else:
-            print(f"No heuristic value found for ({latitude}, {longitude}). Returning default value.")
+            logging.debug(f"No heuristic value found for ({latitude}, {longitude}). Returning default value.")
             return 0.5  # Default value if the coordinate is not found

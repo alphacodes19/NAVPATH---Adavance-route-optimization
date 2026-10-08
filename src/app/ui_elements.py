@@ -1,4 +1,32 @@
+import os
+from pathlib import Path
+
 import pygame
+
+# --- Font loading -----------------------------------------------------
+# Roboto, loaded once per size and cached, instead of the scattered
+# pygame.font.Font(None, size) bitmap-default calls used everywhere before.
+_FONT_DIR = Path(__file__).resolve().parents[2] / "assets" / "fonts"
+_FONT_REGULAR = str(_FONT_DIR / "Roboto-Regular.ttf")
+_FONT_BOLD = str(_FONT_DIR / "Roboto-Bold.ttf")
+
+_font_cache = {}
+
+
+def get_font(size: int, bold: bool = False) -> "pygame.font.Font":
+    """
+    Return a cached Roboto font at the given size.
+    Falls back to pygame's default font if the TTF file is missing.
+    """
+    key = (size, bold)
+    if key not in _font_cache:
+        path = _FONT_BOLD if bold else _FONT_REGULAR
+        try:
+            _font_cache[key] = pygame.font.Font(path, size)
+        except (FileNotFoundError, pygame.error):
+            _font_cache[key] = pygame.font.Font(None, size)
+    return _font_cache[key]
+
 
 # Colors
 WHITE = (255, 255, 255)
@@ -18,18 +46,24 @@ CLICK_EFFECT_COLOR_BOTTOM = (0, 50, 100)
 
 # Input box properties
 input_boxes_position = [(670, 70), (670, 120), (910, 70), (910, 120)]
-new_input_boxes_position = [(900, 280), (1025, 280), (1150, 280)]  # New input boxes below buttons
-horizontal_buttons_position = [(900, 350), (1025, 350), (1150, 350)]  # New horizontal buttons
-ship_dim_button_pos = [(900,420),(1025,420),(1150,420),(1275,420)] #lbh dim
-ship_dim = [(780, 440),(880, 440),(980, 440),(1080, 440)]
+ship_dim_button_pos = [(900, 420), (1025, 420), (1150, 420), (1275, 420)]  # lbh dim
+ship_dim = [(780, 440), (880, 440), (980, 440), (1080, 440)]
 input_box_width = 50 * 1.8
 input_box_height = 40 * 1.1
 input_boxes = ["", "", "", ""]
-new_input_boxes = [False, False, False]  # p and c buttons
-horizontal_buttons = [False, False, False]  # Track state of horizontal buttons(speed,comfo,time)
+new_input_boxes = [False, False, False]  # Cargo / Passenger / Custom
+horizontal_buttons = [False, False, False]  # Fuel / Speed / Comfort sub-priority
 active_box = None
 active_box2 = None
 button_values = ["", "", "", ""]
+
+# Geometry for the primary mode buttons (Cargo/Passenger/Custom) and the
+# Fuel/Speed/Comfort sub-priority buttons. Shared by draw_new_input_boxes()
+# and handle_mouse_click() so they always agree on hit areas.
+_MODE_BTN_W, _MODE_BTN_H = 110, 54
+_MODE_START_X, _MODE_START_Y = 833, 300
+_SUB_BTN_H = 36
+_SUB_Y = _MODE_START_Y + 70
 
 
 # Function to draw gradient-filled rounded rectangles
@@ -44,28 +78,32 @@ def draw_gradient_button(screen, rect, color_top, color_bottom, border_radius=12
     pygame.draw.rect(screen, BUTTON_BORDER_COLOR, rect, width=1, border_radius=border_radius)
     screen.blit(gradient_surface, rect.topleft)
 
+
 # Draw the input boxes with labels
 def draw_input_boxes(screen):
-    font = pygame.font.Font(None, 36)
-    label_font = pygame.font.Font(None, 28)
-    labels = ["Departure X:", "Departure Y:", "Destination X:", "Destination Y:"]
-    
+    font = get_font(36)
+    label_font = get_font(28)
+    labels = ["Departure Lon:", "Departure Lat:", "Destination Lon:", "Destination Lat:"]
+
     for i, pos in enumerate(input_boxes_position):
         label_text = label_font.render(labels[i], True, LABEL_COLOR)
         screen.blit(label_text, (pos[0] - 7, pos[1]))  # Adjusted label position
-        pygame.draw.rect(screen, INPUT_BOX_COLOR, (pos[0] + 130, pos[1] - 10, input_box_width, input_box_height), 2)
+        # Offset widened from 130 -> 150 so "Destination Lon:" fits without clipping.
+        pygame.draw.rect(screen, INPUT_BOX_COLOR,
+                          (pos[0] + 150, pos[1] - 10, input_box_width, input_box_height), 2)
         text = font.render(input_boxes[i], True, WHITE)
-        screen.blit(text, (pos[0] + 135, pos[1] - 3))
-        
+        screen.blit(text, (pos[0] + 155, pos[1] - 3))
+
+
 def draw_dim_boxes(screen):
-    font = pygame.font.Font(None, 36)
-    label_font = pygame.font.Font(None, 28)
+    font = get_font(36)
+    label_font = get_font(28)
     labels = ["L:", "B:", "H:", "Eff:"]
     horizontal_spacing = 100  # Adjust the spacing between boxes
     start_x = 790  # Starting X position for the first box
     start_y_label = 420  # Y position for labels
     start_y_box = 440  # Y position for input boxes
-    
+
     for i, label in enumerate(labels):
         # Calculate positions based on spacing
         label_x = start_x + i * horizontal_spacing
@@ -86,75 +124,60 @@ def draw_dim_boxes(screen):
         screen.blit(text, (text_x, text_y))
 
 
-# Draw the new input boxes with labels
 def draw_new_input_boxes(screen):
-    label_font = pygame.font.Font(None, 28)
-    new_labels = ["C", "P", "I"]
-    horizontal_labels = ["Fuel", "Speed", "Comfort"]  # Labels for horizontal buttons
-    
-    # Custom colors for horizontal buttons
-    horizontal_colors = [
-        ((255, 165, 0), (255, 120, 0)),    # Brown gradient for Fuel
-        ((0, 191, 255), (0, 150, 255)),   # Blue gradient for Speed
-        ((255, 105, 180), (255, 20, 147))     # Purple gradient for Comfort
-    ]
-    
-    # Draw C and P boxes (keeping original style)
-    for i, pos in enumerate(new_input_boxes_position):
-        color = GREEN if new_input_boxes[i] else RED
-        box_rect = pygame.Rect(pos[0] - 67, pos[1] + 20, input_box_width - 5, input_box_height)
-        pygame.draw.rect(screen, color, box_rect, border_radius=10)
-        
-        label_text = label_font.render(new_labels[i], True, WHITE)
-        label_x = box_rect.centerx - label_text.get_width() // 2
-        label_y = box_rect.centery - label_text.get_height() // 2
-        screen.blit(label_text, (label_x, label_y))
-    
-    # Draw horizontal buttons with gradient and different shape
-    for i, pos in enumerate(horizontal_buttons_position):
-        # Determine button state color
-        if horizontal_buttons[i]:
-            color_top, color_bottom = horizontal_colors[i]
-        else:
-            # Desaturated version of the gradient when not active
-            color_top = tuple(int(c * 0.5) for c in horizontal_colors[i][0])
-            color_bottom = tuple(int(c * 0.5) for c in horizontal_colors[i][1])
-        
-        # Create a more interesting button shape (slightly skewed rectangle)
-        box_rect = pygame.Rect(pos[0] - 67, pos[1] + 20, input_box_width - 5, input_box_height)
-        
-        # Create a surface for gradient
-        gradient_surface = pygame.Surface(box_rect.size, pygame.SRCALPHA)
-        for y in range(box_rect.height):
-            blend_ratio = y / box_rect.height
-            r = int(color_top[0] * (1 - blend_ratio) + color_bottom[0] * blend_ratio)
-            g = int(color_top[1] * (1 - blend_ratio) + color_bottom[1] * blend_ratio)
-            b = int(color_top[2] * (1 - blend_ratio) + color_bottom[2] * blend_ratio)
-            pygame.draw.line(gradient_surface, (r, g, b), (0, y), (box_rect.width, y))
-        
-        # Draw skewed rectangle with rounded corners
-        points = [
-            (box_rect.left, box_rect.bottom),
-            (box_rect.left + 10, box_rect.top),
-            (box_rect.right - 10, box_rect.top),
-            (box_rect.right, box_rect.bottom)
-        ]
-        
-        # Create a surface to draw the polygon
-        poly_surface = pygame.Surface(box_rect.size, pygame.SRCALPHA)
-        pygame.draw.polygon(poly_surface, (0, 0, 0, 0), points)
-        poly_surface.blit(gradient_surface, (0, 0))
-        screen.blit(poly_surface, box_rect.topleft)
-        
-        # Add label
-        label_text = label_font.render(horizontal_labels[i], True, WHITE)
-        label_x = box_rect.centerx - label_text.get_width() // 2
-        label_y = box_rect.centery - label_text.get_height() // 2
-        screen.blit(label_text, (label_x, label_y))
-        
-        
+    """
+    Draw the three routing mode buttons (Cargo / Passenger / Custom)
+    and the three sub-priority buttons (Fuel / Speed / Comfort).
+    """
+    font_label = get_font(22, bold=True)
+    font_desc = get_font(18)
+    font_sub = get_font(20, bold=True)
 
-        
+    # --- Primary mode buttons ---
+    mode_labels = ["Cargo", "Passenger", "Custom"]
+    mode_descs = ["Max load · fast", "Comfort · safety", "Set priorities"]
+    mode_colors_on = [(50, 180, 80), (60, 140, 220), (200, 160, 40)]
+    mode_colors_off = [(30, 80, 40), (30, 60, 110), (100, 75, 20)]
+
+    for i in range(3):
+        bx = _MODE_START_X + i * 130
+        by = _MODE_START_Y
+        color = mode_colors_on[i] if new_input_boxes[i] else mode_colors_off[i]
+        box_rect = pygame.Rect(bx, by, _MODE_BTN_W, _MODE_BTN_H)
+
+        pygame.draw.rect(screen, color, box_rect, border_radius=8)
+        if new_input_boxes[i]:
+            pygame.draw.rect(screen, (255, 255, 255), box_rect, 2, border_radius=8)
+
+        lbl = font_label.render(mode_labels[i], True, (255, 255, 255))
+        screen.blit(lbl, (box_rect.centerx - lbl.get_width() // 2, by + 8))
+        desc = font_desc.render(mode_descs[i], True, (200, 200, 200))
+        screen.blit(desc, (box_rect.centerx - desc.get_width() // 2, by + 30))
+
+    # --- Sub-priority buttons (Fuel / Speed / Comfort) ---
+    sub_labels = ["Fuel", "Speed", "Comfort"]
+    sub_colors_on = [(220, 140, 30), (40, 160, 240), (220, 80, 180)]
+    sub_colors_off = [(90, 55, 10), (15, 65, 100), (90, 30, 70)]
+
+    for i in range(3):
+        bx = _MODE_START_X + i * 130
+        color = sub_colors_on[i] if horizontal_buttons[i] else sub_colors_off[i]
+        box_rect = pygame.Rect(bx, _SUB_Y, _MODE_BTN_W, _SUB_BTN_H)
+
+        pygame.draw.rect(screen, color, box_rect, border_radius=6)
+        if horizontal_buttons[i]:
+            pygame.draw.rect(screen, (255, 255, 255), box_rect, 2, border_radius=6)
+
+        lbl = font_sub.render(sub_labels[i], True, (255, 255, 255))
+        screen.blit(lbl, (box_rect.centerx - lbl.get_width() // 2, _SUB_Y + 8))
+
+    # Label above sub-buttons
+    note = get_font(19).render(
+        "Sub-priority (active when Custom is selected):",
+        True, (150, 150, 170))
+    screen.blit(note, (_MODE_START_X, _SUB_Y - 18))
+
+
 # Handle keyboard input for the active box
 def handle_input(event):
     global active_box
@@ -166,7 +189,8 @@ def handle_input(event):
                 pass
             else:
                 input_boxes[active_box] += event.unicode
-                
+
+
 def handle_dir_input(event):
     global active_box2
 
@@ -177,14 +201,14 @@ def handle_dir_input(event):
         (980, 440),  # Box 3 position
         (1080, 440)  # Box 4 position
     ]
-    input_box_width = 100  # Width of each input box
-    input_box_height = 40  # Height of each input box
+    dim_box_width = 100  # Width of each input box
+    dim_box_height = 40  # Height of each input box
 
     if event.type == pygame.MOUSEBUTTONDOWN:
         # Check if the mouse click is inside any input box
         mouse_x, mouse_y = event.pos
         for i, (box_x, box_y) in enumerate(input_box_positions):
-            if box_x <= mouse_x <= box_x + input_box_width and box_y <= mouse_y <= box_y + input_box_height:
+            if box_x <= mouse_x <= box_x + dim_box_width and box_y <= mouse_y <= box_y + dim_box_height:
                 active_box2 = i  # Set the active box to the clicked one
                 break
         else:
@@ -197,62 +221,61 @@ def handle_dir_input(event):
             if event.key == pygame.K_BACKSPACE:
                 if len(button_values[active_box2]) > 0:
                     button_values[active_box2] = button_values[active_box2][:-1]
-            
+
             # Handle enter key (add logic for submission or focus change)
             elif event.key == pygame.K_RETURN:
-                # Add your logic here (e.g., submit or change focus)
                 pass
-            
+
             # Handle regular character input
             elif event.key != pygame.K_BACKSPACE:
                 button_values[active_box2] += event.unicode
 
 
-
-# Handle mouse click to select the active input box
+# Handle mouse click to select the active input box / mode button
 def handle_mouse_click(event):
-    global active_box,active_box2
+    global active_box, active_box2
+
+    # Coordinate input boxes
     for i, pos in enumerate(input_boxes_position):
-        if pygame.Rect(pos[0] + 130, pos[1] - 10, input_box_width, input_box_height).collidepoint(event.pos):
+        if pygame.Rect(pos[0] + 150, pos[1] - 10,
+                        input_box_width, input_box_height).collidepoint(event.pos):
             active_box = i
             break
-    
-    for i, pos in enumerate(ship_dim):
-        if pygame.Rect(pos[0] + 130, pos[1] - 10, input_box_width, input_box_height).collidepoint(event.pos):
-            active_box2 = i
-            print(button_values)
-            break    
 
-    # Check for clicks on the C and P and I boxes
-    for i, pos in enumerate(new_input_boxes_position):
-        if pygame.Rect(pos[0] - 67, pos[1] + 20, input_box_width - 5, input_box_height).collidepoint(event.pos):
+    # Ship dimension boxes
+    for i, pos in enumerate(ship_dim):
+        if pygame.Rect(pos[0] + 130, pos[1] - 10,
+                        input_box_width, input_box_height).collidepoint(event.pos):
+            active_box2 = i
+            break
+
+    # Primary mode buttons (Cargo / Passenger / Custom)
+    for i in range(3):
+        bx = _MODE_START_X + i * 130
+        if pygame.Rect(bx, _MODE_START_Y, _MODE_BTN_W, _MODE_BTN_H).collidepoint(event.pos):
             for j in range(len(new_input_boxes)):
                 new_input_boxes[j] = False
             new_input_boxes[i] = True
             break
-    
-    # Check for clicks on horizontal buttons
-    for i, pos in enumerate(horizontal_buttons_position):
-        if pygame.Rect(pos[0] - 67, pos[1] + 20, input_box_width - 5, input_box_height).collidepoint(event.pos):
+
+    # Sub-priority buttons (Fuel / Speed / Comfort)
+    for i in range(3):
+        bx = _MODE_START_X + i * 130
+        if pygame.Rect(bx, _SUB_Y, _MODE_BTN_W, _SUB_BTN_H).collidepoint(event.pos):
             for j in range(len(horizontal_buttons)):
                 horizontal_buttons[j] = False
             horizontal_buttons[i] = True
             break
 
-# Draw "Manual" / "Automatic" button
+
+# Draw "Click on Map" / "Type Coordinates" button
 def draw_button(screen, show_input_boxes, is_clicked=False):
-    # Widened from 220 to 260px, and the font size dropped slightly (36->30)
-    # to comfortably fit "Type Coordinates" / "Click on Map" — the old
-    # "Manual"/"Automatic" labels were shorter and fit at the old size, but
-    # these fuller, clearer labels need a bit more room.
     button_rect = pygame.Rect(670, 200, 260, 60)
 
-    # Shadow effect
     shadow_rect = button_rect.copy()
     shadow_rect.topleft = (shadow_rect.x + 3, shadow_rect.y + 3)
     pygame.draw.rect(screen, SHADOW_COLOR, shadow_rect, border_radius=8)
 
-    # Button appearance
     if is_clicked:
         draw_gradient_button(screen, button_rect, CLICK_EFFECT_COLOR_TOP, CLICK_EFFECT_COLOR_BOTTOM)
     elif show_input_boxes:
@@ -260,51 +283,80 @@ def draw_button(screen, show_input_boxes, is_clicked=False):
     else:
         draw_gradient_button(screen, button_rect, MANUAL_COLOR_TOP, MANUAL_COLOR_BOTTOM)
 
-    font = pygame.font.Font(None, 30)
-    # Renamed from "Manual"/"Automatic" — that labeling was backwards from
-    # what either state actually does (the "Manual" label was shown while
-    # input boxes were hidden, i.e. while you select points by clicking).
+    font = get_font(30)
     button_text = "Type Coordinates" if show_input_boxes else "Click on Map"
     button_text_rendered = font.render(button_text, True, BUTTON_TEXT_COLOR)
     screen.blit(button_text_rendered, (button_rect.centerx - button_text_rendered.get_width() // 2,
-                                       button_rect.centery - button_text_rendered.get_height() // 2))
+                                        button_rect.centery - button_text_rendered.get_height() // 2))
     return button_rect
 
-# Draw "Start" button with modern and on-click effects
+
+# Draw "Start"/"Calculate" button with modern and on-click effects
 def draw_start_button(screen, is_clicked=False):
     button_rect = pygame.Rect(950, 200, 220, 60)
 
-    # Shadow effect
     shadow_rect = button_rect.copy()
     shadow_rect.topleft = (shadow_rect.x + 3, shadow_rect.y + 3)
     pygame.draw.rect(screen, SHADOW_COLOR, shadow_rect, border_radius=8)
 
-    # Button appearance
     if is_clicked:
         draw_gradient_button(screen, button_rect, CLICK_EFFECT_COLOR_TOP, CLICK_EFFECT_COLOR_BOTTOM)
     else:
         draw_gradient_button(screen, button_rect, (0, 150, 255), (0, 100, 200))
 
-    # Button text
-    font = pygame.font.Font(None, 36)
+    font = get_font(36)
     text = font.render("Calculate", True, BUTTON_TEXT_COLOR)
     screen.blit(text, (button_rect.centerx - text.get_width() // 2,
-                       button_rect.centery - text.get_height() // 2))
+                        button_rect.centery - text.get_height() // 2))
     return button_rect
 
-# Placeholder for "Fuel Estimation" button
-def draw_fuel_estimation_button(screen):
-    pass
 
-# Placeholder for "Image Analysis" button
+def draw_reset_button(screen):
+    button_rect = pygame.Rect(670, 270, 260, 45)
+    shadow_rect = button_rect.copy()
+    shadow_rect.topleft = (shadow_rect.x + 3, shadow_rect.y + 3)
+    pygame.draw.rect(screen, SHADOW_COLOR, shadow_rect, border_radius=8)
+    draw_gradient_button(screen, button_rect, (180, 60, 60), (140, 30, 30))
+    font = get_font(28)
+    text = font.render("Reset Route", True, BUTTON_TEXT_COLOR)
+    screen.blit(text, (button_rect.centerx - text.get_width() // 2,
+                        button_rect.centery - text.get_height() // 2))
+    return button_rect
+
+
+def draw_fuel_estimation_button(screen):
+    """Toggle the fuel-estimation detail overlay (see src/app/route_panel.py)."""
+    button_rect = pygame.Rect(670, 378, 560, 40)
+    shadow_rect = button_rect.copy()
+    shadow_rect.topleft = (shadow_rect.x + 2, shadow_rect.y + 2)
+    pygame.draw.rect(screen, SHADOW_COLOR, shadow_rect, border_radius=6)
+    draw_gradient_button(screen, button_rect, (180, 100, 20), (130, 65, 10))
+    font = get_font(26)
+    text = font.render("Fuel Estimation", True, BUTTON_TEXT_COLOR)
+    screen.blit(text, (button_rect.centerx - text.get_width() // 2,
+                        button_rect.centery - text.get_height() // 2))
+    return button_rect
+
+
+# Placeholder for "Image Analysis" button (not implemented)
 def draw_image_analysis_button(screen):
     pass
 
-# Placeholder for "Retrain Model" button
+
+# Placeholder for "Retrain Model" button (not implemented)
 def draw_retrain_model_button(screen):
     pass
 
-# Placeholder for "Path Coordinates" button
-def draw_path_coordinates_button(screen):
-    pass
 
+def draw_path_coordinates_button(screen):
+    """Export the current route to CSV and GPX (see src/engine/exporter.py)."""
+    button_rect = pygame.Rect(670, 330, 560, 40)  # below the mode buttons
+    shadow_rect = button_rect.copy()
+    shadow_rect.topleft = (shadow_rect.x + 2, shadow_rect.y + 2)
+    pygame.draw.rect(screen, SHADOW_COLOR, shadow_rect, border_radius=6)
+    draw_gradient_button(screen, button_rect, (40, 120, 80), (20, 80, 50))
+    font = get_font(26)
+    text = font.render("Export Route  (CSV + GPX)", True, BUTTON_TEXT_COLOR)
+    screen.blit(text, (button_rect.centerx - text.get_width() // 2,
+                        button_rect.centery - text.get_height() // 2))
+    return button_rect

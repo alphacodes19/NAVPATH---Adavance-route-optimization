@@ -316,3 +316,67 @@ def compute_route_stats(path: list, depth_grid: dict, fuel_grid: dict) -> dict:
         "min_depth_m": round(min_depth, 1) if min_depth is not None else None,
         "cell_count": len(path),
     }
+
+# ---------------------------------------------------------------------------
+# Route explanation (human-readable summary of what shaped the route)
+# ---------------------------------------------------------------------------
+def explain_route(path: list, depth_grid: dict, fuel_grid: dict,
+                   land_cells: set) -> str:
+    """
+    Generate a one-paragraph explanation of what shaped this route.
+    Used in the UI status area and the export file.
+    """
+    if not path or len(path) < 2:
+        return "No route to explain."
+
+    total = len(path)
+    shallow_cells = 0
+    high_fuel_cells = 0
+    low_fuel_cells = 0
+
+    for cell in path:
+        d = depth_grid.get(cell)
+        if d is not None and d > -15:
+            shallow_cells += 1
+
+        fs = fuel_grid.get(cell, 0.5)
+        if fs < 0.35:
+            low_fuel_cells += 1
+        elif fs > 0.65:
+            high_fuel_cells += 1
+
+    parts = []
+
+    if shallow_cells == 0:
+        parts.append("stayed in deep water throughout")
+    elif shallow_cells < total * 0.1:
+        parts.append(f"briefly crossed shallow water ({shallow_cells} cells)")
+    else:
+        parts.append(f"passed through shallow sections ({shallow_cells} cells — consider a larger draft margin)")
+
+    fuel_pct = low_fuel_cells / total * 100
+    if fuel_pct > 60:
+        parts.append(f"{fuel_pct:.0f}% of the route used fuel-efficient cells")
+    elif high_fuel_cells > total * 0.3:
+        parts.append("significant portion of route passed through fuel-heavy zones")
+
+    stats = compute_route_stats(path, depth_grid, fuel_grid)
+    dist = stats.get("distance_nm", 0)
+    # Straight-line distance (approximate)
+    start, end = path[0], path[-1]
+    straight_cells = _euclidean(start, end)
+    straight_nm = straight_cells * NM_PER_CELL_STRAIGHT
+    if straight_nm > 0:
+        detour_pct = (dist - straight_nm) / straight_nm * 100
+        if detour_pct > 5:
+            parts.append(
+                f"route is {detour_pct:.0f}% longer than the straight-line distance "
+                f"({dist:.0f} nm vs {straight_nm:.0f} nm direct) — detour is intentional to avoid obstacles or optimise cost"
+            )
+        else:
+            parts.append(f"route closely follows the direct line ({dist:.0f} nm)")
+
+    if not parts:
+        return f"Route found: {dist:.0f} nm, {total} waypoints."
+
+    return "Route summary: " + " · ".join(parts) + "."

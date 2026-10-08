@@ -10,6 +10,7 @@ import os
 from dotenv import load_dotenv
 
 from src import config
+from src.app.ui_elements import get_font
 
 # Initialize Pygame
 pygame.init()
@@ -19,12 +20,9 @@ WHITE = (255, 255, 255)
 TEXT_COLOR = WHITE
 BACKGROUND_COLOR = (30, 30, 30)
 BORDER_COLOR = (128, 128, 128)
+DIM_COLOR = (90, 90, 110)
 SCREEN_WIDTH, SCREEN_HEIGHT = 800, 600
 BLACK = (0, 0, 0)
-
-# Fonts
-def load_custom_font(size):
-    return pygame.font.Font(None, size)  # Use a custom font path if desired.
 
 # Load API Key
 load_dotenv(config.PROJECT_ROOT / ".env")
@@ -72,27 +70,55 @@ def get_weather_data(latitude, longitude):
     _weather_cache[cache_key] = (time.time(), result)
     return result
 
+
+def draw_weather_placeholder(screen, box_x: int, box_y: int,
+                              box_w: int, box_h: int, label: str):
+    """
+    Draw an empty weather box with a prompt instead of fetching
+    irrelevant weather data when no route endpoint is selected.
+    """
+    pygame.draw.rect(screen, BORDER_COLOR,
+                      (box_x - 2, box_y - 2, box_w + 4, box_h + 4),
+                      border_radius=10)
+    pygame.draw.rect(screen, BACKGROUND_COLOR,
+                      (box_x, box_y, box_w, box_h),
+                      border_radius=10)
+
+    label_font = get_font(28, bold=True)
+    hint_font = get_font(22)
+
+    lbl = label_font.render(label, True, (200, 200, 220))
+    screen.blit(lbl, (box_x + box_w // 2 - lbl.get_width() // 2,
+                       box_y + 14))
+
+    hint = hint_font.render("Select a route endpoint", True, DIM_COLOR)
+    screen.blit(hint, (box_x + box_w // 2 - hint.get_width() // 2,
+                        box_y + 50))
+
+    hint2 = hint_font.render("to see live weather", True, DIM_COLOR)
+    screen.blit(hint2, (box_x + box_w // 2 - hint2.get_width() // 2,
+                         box_y + 72))
+
+
 # Function to display weather for the first location (departure)
 def weather(screen, latitude, longitude):
     # Fetch weather data
     weather_data = get_weather_data(latitude, longitude)
 
     # Set up font and positioning
-    weather_font = load_custom_font(24)
-    label_font = load_custom_font(32)
-    x_position = SCREEN_WIDTH * 3 // 4 + 80  # Shift right by 240 pixels
-    y_position = SCREEN_HEIGHT * 3 // 4 + 15 # Adjust Y position for quadrant
+    weather_font = get_font(24)
+    label_font = get_font(32)
 
     # Box properties
     box_width, box_height = 240, 180
-    
-    #text to display
+
+    # text to display
     departure_label = label_font.render("Pref. Ship:", True, BLACK)
     screen.blit(departure_label, (700, 310))
-    
+
     departure_label = label_font.render("Parameters:", True, BLACK)
     screen.blit(departure_label, (680, 380))
-    
+
     departure_label = label_font.render("Ship dim:", True, BLACK)
     screen.blit(departure_label, (680, 450))
 
@@ -121,14 +147,15 @@ def weather(screen, latitude, longitude):
         label = weather_font.render(text, True, TEXT_COLOR)
         screen.blit(label, (700 + 10, 550 + 20 + (i * 30)))  # Adjust line spacing
 
+
 # Function to display weather for the second location (destination)
 def weatherTwo(screen, latitude, longitude):
     # Fetch weather data
     weather_data = get_weather_data(latitude, longitude)
 
     # Set up font and positioning
-    weather_font = load_custom_font(24)
-    label_font = load_custom_font(32)
+    weather_font = get_font(24)
+    label_font = get_font(32)
     x_position = 970  # Shift right by 240 pixels
     y_position = 550  # Adjust Y position for quadrant
 
@@ -159,4 +186,3 @@ def weatherTwo(screen, latitude, longitude):
     for i, text in enumerate(weather_text):
         label = weather_font.render(text, True, TEXT_COLOR)
         screen.blit(label, (x_position + 10, y_position + 20 + (i * 30)))  # Adjust line spacing
- 

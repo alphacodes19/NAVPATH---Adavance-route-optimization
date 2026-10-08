@@ -1,14 +1,10 @@
 import sys
-import math
 import threading
 import queue
-from pathlib import Path
-from queue import PriorityQueue
 import logging
-logging.basicConfig(level = logging.WARNING)
-from src.engine import depth_cells
-from src.engine import router as route_engine
-from src.engine.router import RouteParams, run_astar, compute_route_stats
+from pathlib import Path
+
+logging.basicConfig(level=logging.WARNING)
 
 # allow running this file directly (`python src/app/main.py`) as well as
 # as a module (`python -m src.app.main`) from the project root
@@ -18,30 +14,23 @@ import pygame
 
 from src import config
 from src.app import ui_elements
-from src.app.ui_elements import horizontal_buttons
 from src.app import weather_display
+from src.app import route_panel
 from src.app.intro_animation import play_intro_animation
 from src.engine.coord_convert import (
     grid_to_latitude, grid_to_longitude, latitude_to_grid, longitude_to_grid,
     round_longitude, round_latitude,
 )
 from src.engine import storage  # For the map boundary
-from src.engine.heuristic_retriever import HeuristicRetriever
-from src.engine import wind_retriever
-from src.engine import current_retriever
-from src.engine import fuel_retriever as fuel_retriever_lib
+from src.engine import depth_cells
+from src.engine import router as route_engine
+from src.engine.router import RouteParams, run_astar, compute_route_stats, explain_route
+from src.engine.exporter import export_csv, export_gpx
 
 clock = pygame.time.Clock()
 
 # Initialize Pygame
 pygame.init()
-heuristic_retriever = HeuristicRetriever()
-fuel_retriever = fuel_retriever_lib.FuelEfficiencyRetriever()
-# Loaded once and reused — the original code re-instantiated (and re-read the
-# pickle file from disk) on every single A* neighbor check, which is very
-# slow once the search space grows.
-wind_direction_retriever = wind_retriever.WindDirectionRetriever()
-ocean_current_retriever = current_retriever.OceanCurrentRetriever()
 intro_video_path = config.INTRO_VIDEO
 
 # Set up the display
@@ -82,20 +71,23 @@ map_position = (100, 70)
 _india_map_surface = pygame.transform.scale(pygame.image.load(config.INDIA_MAP_IMG), (550, 600))
 _india_overlay_surface = pygame.transform.scale(pygame.image.load(config.INDIA_FOREGROUND_IMG), (550, 600))
 
+
 def background():
     screen.blit(_india_map_surface, map_position)
+
 
 def foreground():
     # No longer drawn during normal play — see build_land_mask() below.
     # Kept so a debug view can still show the raw land/sea mask on request.
     screen.blit(_india_overlay_surface, map_position)
 
+
 # Function to draw grid over the background
 def drawGrid():
     for x in range(map_position[0], map_position[0] + 550, grid_size):
         pygame.draw.line(screen, BLUE, (x, map_position[1]), (x, map_position[1] + 600))
     for y in range(map_position[1], map_position[1] + 600, grid_size):
-        if(y>350):
+        if y > 350:
             pygame.draw.line(screen, BLUE, (map_position[0], y), (map_position[0] + 550, y))
 
 
@@ -127,12 +119,14 @@ def build_land_mask():
                 land_cells.add((gx, gy))
     return land_cells
 
-LAND_CELLS = build_land_mask():
-    # --- Depth index (preloaded for O(1) lookup during A*) ---
+
+LAND_CELLS = build_land_mask()
+
+# --- Depth index (preloaded for O(1) lookup during A*) ---
 # depth_cells.process_csv() returns a dict keyed by "grid_x,grid_y" → depth (metres, negative = below sea level)
 # We convert to a (int, int) keyed dict for cleaner access.
 _DEPTH_CSV = str(config.PROCESSED_DIR / "output_depth_data.csv")
-_raw_depth = depth_cells.process_csv(_DEPTH_CSV) if __import__('os').path.exists(_DEPTH_CSV) else {}
+_raw_depth = depth_cells.process_csv(_DEPTH_CSV) if Path(_DEPTH_CSV).exists() else {}
 DEPTH_GRID = {
     (int(k.split(',')[0]), int(k.split(',')[1])): v
     for k, v in _raw_depth.items()
@@ -142,12 +136,6 @@ logging.info(f"Depth grid loaded: {len(DEPTH_GRID)} cells")
 # Default minimum safe depth (metres). Vessel draft increases this via get_ship_size_factor().
 # A typical coastal cargo ship has a draft of ~6-8m; we add a 2m safety margin.
 MIN_SAFE_DEPTH = -10.0  # -10m means at least 10m below sea level
-
- 
-# AFTER — is_aligned_with_wind
-
-    
-# A* Algorithm with new heuristic integration
 
 
 def get_ship_size_factor():
@@ -177,6 +165,7 @@ def get_ship_size_factor():
     size_ratio = (length * beam * height) / reference_volume
     return size_ratio / efficiency
 
+
 def get_min_depth_for_vessel():
     """
     Derive minimum required depth from vessel dimensions if entered.
@@ -195,10 +184,15 @@ def get_min_depth_for_vessel():
     return MIN_SAFE_DEPTH
 
 
-#adjust this on the day of hackathon
-# In calculate_fscore, add this at the very top of the function, before anything else:
-
-# Get neighbors for A* (8-way movement)
+def _get_individual_mode():
+    """Read Fuel/Speed/Comfort button state and return mode string."""
+    if ui_elements.horizontal_buttons[0]:
+        return "fuel"
+    elif ui_elements.horizontal_buttons[1]:
+        return "speed"
+    elif ui_elements.horizontal_buttons[2]:
+        return "comfort"
+    return "speed"  # default
 
 
 # Function to check if a pixel is black — now a fast lookup against the
@@ -207,14 +201,15 @@ def get_min_depth_for_vessel():
 def is_black_pixel(x, y):
     return (x, y) in LAND_CELLS
 
-# Main loop
+
+# Main loop state
 running = True
-path_found = False  # New flag to check if the path has been found
+path_found = False  # True once a route has been found
 show_input_boxes = False  # Flag to control input box visibility
 start_button_clicked = False  # Flag to check if the start button is clicked
 exploration_done = False  # Flag to prevent multiple explorations
-selected_start = None # To store the start point : interactive click
-selected_end = None # To store the end point : interactive click
+selected_start = None  # To store the start point : interactive click
+selected_end = None  # To store the end point : interactive click
 start_x = None
 start_y = None
 end_x = None
@@ -228,15 +223,17 @@ status_message = ""
 status_message_time = 0
 STATUS_MESSAGE_SECONDS = 4
 
+
 def set_status(message):
     global status_message, status_message_time
     print(message)
     status_message = message
     status_message_time = pygame.time.get_ticks()
 
+
 def draw_status_message(screen):
     if status_message and pygame.time.get_ticks() - status_message_time < STATUS_MESSAGE_SECONDS * 1000:
-        font = pygame.font.Font(None, 30)
+        font = ui_elements.get_font(30)
         text = font.render(status_message, True, (255, 255, 255))
         box = text.get_rect()
         box.topleft = (map_position[0], map_position[1] - 35)
@@ -244,8 +241,51 @@ def draw_status_message(screen):
         pygame.draw.rect(screen, (180, 0, 0), bg_rect, border_radius=6)
         screen.blit(text, box)
 
+
+# --- Threading: A* runs on a background thread so the UI stays responsive ---
+_route_queue = queue.Queue()   # communication channel from A* thread to main thread
+_route_thread = None           # reference to the running thread (None when idle)
+_is_searching = False          # True while A* thread is alive
+_current_path = None           # the last successfully found path
+_explored_cells = []           # cells to draw red (accumulated from queue)
+_route_stats = {}              # stats dict returned by compute_route_stats()
+_route_explanation = ""        # human-readable summary of the last route
+_show_fuel_detail = False      # whether the fuel-estimation overlay is open
+
+
+def _astar_thread_worker(params: RouteParams, result_queue: queue.Queue):
+    """
+    Runs A* on a background thread.
+    Sends progress and results back to the main thread via result_queue.
+    Never touches pygame directly.
+    """
+    def on_cell_explored(cell):
+        result_queue.put({"type": "explored", "cell": cell})
+
+    try:
+        path, explored = run_astar(params, progress_callback=on_cell_explored)
+
+        if path:
+            stats = compute_route_stats(
+                path,
+                params.depth_grid,
+                route_engine._fuel_retriever._index,
+            )
+            result_queue.put({
+                "type": "done",
+                "path": path,
+                "explored": explored,
+                "stats": stats,
+            })
+        else:
+            result_queue.put({"type": "error", "msg": "No path found"})
+
+    except Exception as e:
+        logging.exception("A* thread failed")
+        result_queue.put({"type": "error", "msg": str(e)})
+
+
 while running:
-    # AFTER (correctly merged)
     for event in pygame.event.get():
         if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE):
             running = False
@@ -254,9 +294,49 @@ while running:
             # --- Button clicks ---
             if ui_elements.draw_button(screen, show_input_boxes).collidepoint(event.pos):
                 show_input_boxes = not show_input_boxes
+
             if ui_elements.draw_start_button(screen).collidepoint(event.pos):
                 start_button_clicked = True
                 exploration_done = False
+
+            if ui_elements.draw_reset_button(screen).collidepoint(event.pos):
+                # Reset all route state
+                selected_start = None
+                selected_end = None
+                _current_path = None
+                _explored_cells.clear()
+                _route_stats = {}
+                _route_explanation = ""
+                _show_fuel_detail = False
+                path_found = False
+                exploration_done = False
+                start_button_clicked = False
+                _is_searching = False
+                background()
+                drawGrid()
+                set_status("Route cleared")
+
+            if ui_elements.draw_path_coordinates_button(screen).collidepoint(event.pos):
+                if _current_path and _route_stats:
+                    cargo_sel, passenger_sel = ui_elements.new_input_boxes[0], ui_elements.new_input_boxes[1]
+                    current_mode = "cargo" if cargo_sel else ("passenger" if passenger_sel else _get_individual_mode())
+                    try:
+                        csv_path = export_csv(_current_path, _route_stats, current_mode,
+                                               output_dir="exports")
+                        gpx_path = export_gpx(_current_path, _route_stats, current_mode,
+                                               output_dir="exports")
+                        set_status(f"Exported → exports/{current_mode}_*.csv + .gpx")
+                        logging.info(f"Exported CSV: {csv_path}")
+                        logging.info(f"Exported GPX: {gpx_path}")
+                    except Exception as e:
+                        set_status(f"Export failed: {e}")
+                        logging.exception("Export failed")
+                else:
+                    set_status("Calculate a route first before exporting")
+
+            if ui_elements.draw_fuel_estimation_button(screen).collidepoint(event.pos):
+                _show_fuel_detail = not _show_fuel_detail  # toggle
+
             ui_elements.handle_mouse_click(event)
 
             # --- Map clicks ---
@@ -283,87 +363,224 @@ while running:
             ui_elements.handle_input(event)
             ui_elements.handle_dir_input(event)
 
+    # -----------------------------------------------------------------------
+    # Drain the route queue — process messages from the A* thread
+    # -----------------------------------------------------------------------
+    while not _route_queue.empty():
+        try:
+            msg = _route_queue.get_nowait()
+        except queue.Empty:
+            break
+
+        if msg["type"] == "explored":
+            cell = msg["cell"]
+            _explored_cells.append(cell)
+            # Draw explored cell immediately in red
+            pygame.draw.rect(
+                screen, RED,
+                (map_position[0] + cell[0] * grid_size,
+                 map_position[1] + cell[1] * grid_size,
+                 grid_size, grid_size),
+            )
+
+        elif msg["type"] == "done":
+            _is_searching = False
+            exploration_done = True
+            path_found = True
+            _current_path = msg["path"]
+            _route_stats = msg.get("stats", {})
+
+            # Draw the final path in green
+            background()
+            drawGrid()
+            # Redraw explored nodes so they show under the path
+            for cell in _explored_cells:
+                pygame.draw.rect(
+                    screen, RED,
+                    (map_position[0] + cell[0] * grid_size,
+                     map_position[1] + cell[1] * grid_size,
+                     grid_size, grid_size),
+                )
+            for cell in _current_path:
+                pygame.draw.rect(
+                    screen, GREEN,
+                    (map_position[0] + cell[0] * grid_size,
+                     map_position[1] + cell[1] * grid_size,
+                     grid_size, grid_size),
+                )
+
+            dist = _route_stats.get("distance_nm", "?")
+            depth = _route_stats.get("min_depth_m", "?")
+            set_status(f"Route found — {dist} nm · min depth {depth} m")
+            logging.info(f"Route stats: {_route_stats}")
+
+            # Generate and store the route explanation
+            _route_explanation = explain_route(
+                _current_path,
+                DEPTH_GRID,
+                route_engine._fuel_retriever._index,
+                LAND_CELLS,
+            )
+            logging.info(f"Route explanation: {_route_explanation}")
+
+        elif msg["type"] == "error":
+            _is_searching = False
+            exploration_done = True
+            set_status(msg["msg"])
+
     screen.blit(background_image, (0, 0))  # Draw the background image
 
     # Draw background and grid
     background()
     drawGrid()
     # foreground() no longer drawn here — see build_land_mask() above.
-  
-    if start_x and start_y and end_x and end_y:
-        weather_display.weather(screen,  start_y,  start_x )
-        weather_display.weatherTwo(screen,  end_y,  end_x )
+
+    if start_x and start_y:
+        weather_display.weather(screen, start_y, start_x)
     else:
-        weather_display.weather(screen, 28.6139, 77.2090)
-        weather_display.weatherTwo(screen, 35.00, 45.2090)
+        weather_display.draw_weather_placeholder(screen, 700, 550, 240, 180, "Departure")
+
+    if end_x and end_y:
+        weather_display.weatherTwo(screen, end_y, end_x)
+    else:
+        weather_display.draw_weather_placeholder(screen, 970, 550, 240, 180, "Destination")
+
     ui_elements.draw_fuel_estimation_button(screen)
     ui_elements.draw_image_analysis_button(screen)
     ui_elements.draw_retrain_model_button(screen)
     ui_elements.draw_path_coordinates_button(screen)
     ui_elements.draw_dim_boxes(screen)
-    
-    # Draw the "Start" button
-    ui_elements.draw_start_button(screen)  # Ensure the "Start" button is drawn
+    ui_elements.draw_reset_button(screen)
 
-    # Draw "Automatic" / "Manual" button
+    # Draw the "Calculate" button
+    ui_elements.draw_start_button(screen)
+
+    # Draw "Click on Map" / "Type Coordinates" button
     ui_elements.draw_button(screen, show_input_boxes)
 
     # Display input boxes if show_input_boxes is active
     if show_input_boxes:
-        ui_elements.draw_input_boxes(screen) 
+        ui_elements.draw_input_boxes(screen)
 
     ui_elements.draw_new_input_boxes(screen)
     draw_status_message(screen)
-    
-    cargo, passenger = ui_elements.new_input_boxes[0], ui_elements.new_input_boxes[1]
-    
 
-    # If the start button is clicked and coordinates are provided
-    if start_button_clicked and ((all(ui_elements.input_boxes)) or (selected_start != None and selected_end != None)) and not exploration_done:
+    cargo, passenger = ui_elements.new_input_boxes[0], ui_elements.new_input_boxes[1]
+
+    # -----------------------------------------------------------------------
+    # Launch A* in a background thread when Calculate is clicked
+    # -----------------------------------------------------------------------
+    if start_button_clicked and not exploration_done and not _is_searching:
+        start_button_clicked = False  # consume the click
+
+        # Resolve start/end grid coordinates from whichever input method is active
+        coords_ok = False
         try:
             if all(ui_elements.input_boxes):
-                # Convert input latitudes and longitudes to grid coordinates
                 start_longitude = float(ui_elements.input_boxes[0])
                 start_latitude = float(ui_elements.input_boxes[1])
                 end_longitude = float(ui_elements.input_boxes[2])
                 end_latitude = float(ui_elements.input_boxes[3])
-                
-                # Use CoordConv functions to convert to grid coordinates
                 start = (longitude_to_grid(start_longitude), latitude_to_grid(start_latitude))
                 end = (longitude_to_grid(end_longitude), latitude_to_grid(end_latitude))
-                logging.info(f"A* start={start} end={end}")
-                # Validate the grid coordinates
-                if 0 <= start[0] < grid_width and 0 <= start[1] < grid_height and \
-                0 <= end[0] < grid_width and 0 <= end[1] < grid_height:
-                    # Call A* algorithm
-                    path, explored_nodes = a_star(start, end, cargo, passenger)
-                    if path:
-                        path_found = True  # Mark that the path is found
-                        pygame.display.flip()  # Update the screen after drawing the path
-                    else:
-                        set_status("Path not found")
-                    exploration_done = True  # Set the flag to prevent further exploration
+                if (0 <= start[0] < grid_width and 0 <= start[1] < grid_height and
+                        0 <= end[0] < grid_width and 0 <= end[1] < grid_height):
+                    start_x = start_longitude
+                    start_y = start_latitude
+                    end_x = end_longitude
+                    end_y = end_latitude
+                    coords_ok = True
                 else:
                     set_status("Invalid start or end coordinates")
-                    
-            else:
+            elif selected_start is not None and selected_end is not None:
                 start = selected_start
+                end = selected_end
                 start_y = grid_to_latitude(start[1])
                 start_x = grid_to_longitude(start[0])
-                end = selected_end
                 end_y = grid_to_latitude(end[1])
                 end_x = grid_to_longitude(end[0])
-                path, explored_nodes = a_star(start,end, cargo, passenger)
-                if path:
-                    path_found = True
-                    pygame.display.flip()
-                else:
-                    set_status("Path not found")
-                
-                exploration_done = True                
-                
+                coords_ok = True
+            else:
+                set_status("Please select start and end points")
+
         except ValueError:
-            set_status("Please enter valid integers for coordinates")
+            set_status("Please enter valid numbers for coordinates")
+
+        if coords_ok:
+            # Determine mode from UI state
+            if cargo:
+                mode = "cargo"
+            elif passenger:
+                mode = "passenger"
+            else:
+                mode = _get_individual_mode()
+
+            params = RouteParams(
+                start=start,
+                end=end,
+                mode=mode,
+                land_cells=LAND_CELLS,
+                depth_grid=DEPTH_GRID,
+                ship_size_factor=get_ship_size_factor(),
+                min_depth=get_min_depth_for_vessel(),
+            )
+
+            # Clear previous results
+            _explored_cells.clear()
+            _current_path = None
+            _route_stats = {}
+            _route_explanation = ""
+            path_found = False
+            exploration_done = False
+            _is_searching = True
+
+            set_status(f"Calculating {mode} route...")
+
+            # Kick off the search thread
+            _route_thread = threading.Thread(
+                target=_astar_thread_worker,
+                args=(params, _route_queue),
+                daemon=True,   # thread dies if main window closes
+            )
+            _route_thread.start()
+
+    # Draw route panel + explanation if a route has been found
+    if path_found and _route_stats:
+        current_mode = "cargo" if cargo else ("passenger" if passenger else _get_individual_mode())
+        route_panel.draw_route_panel(screen, _route_stats, current_mode)
+
+    if path_found and _route_explanation:
+        font_exp = ui_elements.get_font(22)
+        # Word-wrap to fit panel width (560px)
+        words = _route_explanation.split()
+        lines = []
+        current_line = ""
+        for word in words:
+            test = current_line + (" " if current_line else "") + word
+            if font_exp.size(test)[0] > 540:
+                lines.append(current_line)
+                current_line = word
+            else:
+                current_line = test
+        if current_line:
+            lines.append(current_line)
+
+        exp_y = 780  # below the stats panel (panel ends at 550 + 220 = 770)
+        for line in lines[:3]:  # max 3 lines
+            surf = font_exp.render(line, True, (160, 160, 180))
+            screen.blit(surf, (670, exp_y))
+            exp_y += 20
+
+    if _show_fuel_detail and _route_stats:
+        route_panel.draw_fuel_detail(screen, _route_stats, get_ship_size_factor())
+
+    # Show "Searching..." spinner while A* thread is alive
+    if _is_searching:
+        font = ui_elements.get_font(28)
+        elapsed_ms = pygame.time.get_ticks()
+        dots = "." * ((elapsed_ms // 500) % 4)  # cycles 0→1→2→3 dots every 500ms
+        searching_text = font.render(f"Searching{dots}", True, (255, 255, 100))
+        screen.blit(searching_text, (map_position[0], map_position[1] - 35))
 
     pygame.display.flip()
     clock.tick(30)
