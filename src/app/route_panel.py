@@ -471,6 +471,105 @@ def draw_pareto_panel(screen, pareto_results: list, selected_index: int) -> dict
     return point_rects
 
 
+def draw_benchmark_panel(screen, benchmark_results: dict, selected_key: str) -> dict:
+    """
+    Side-by-side table for router.benchmark.run_benchmark()'s three
+    algorithms (Dijkstra / Greedy / A*). Same layout convention as
+    draw_comparison_panel(), with two rows specific to a benchmark that
+    the route-comparison panels don't have: nodes explored and search time.
+
+    Returns {key: pygame.Rect} for each column header, for main.py to
+    hit-test clicks and change which algorithm's route is highlighted.
+    """
+    if not benchmark_results:
+        return {}
+
+    panel_x, panel_y, panel_w, panel_h = 670, 550, 560, 220
+
+    pygame.draw.rect(screen, PANEL_BORDER,
+                      (panel_x - 2, panel_y - 2, panel_w + 4, panel_h + 4),
+                      border_radius=10)
+    pygame.draw.rect(screen, PANEL_BG,
+                      (panel_x, panel_y, panel_w, panel_h),
+                      border_radius=10)
+
+    font_title = get_font(24)
+    font_label = get_font(18)
+    font_value = get_font(20)
+
+    title = font_title.render("ALGORITHM BENCHMARK", True, TITLE_COLOUR)
+    screen.blit(title, (panel_x + 12, panel_y + 8))
+    pygame.draw.line(screen, PANEL_BORDER,
+                      (panel_x + 10, panel_y + 32),
+                      (panel_x + panel_w - 10, panel_y + 32))
+
+    keys = ["dijkstra", "greedy", "astar"]
+    display_names = {"dijkstra": "DIJKSTRA", "greedy": "GREEDY", "astar": "A*"}
+    key_colours = {"dijkstra": (120, 180, 255), "greedy": (255, 150, 100), "astar": (120, 230, 150)}
+
+    label_col_w = 140
+    col_w = (panel_w - label_col_w - 16) // 3
+    col_x = {key: panel_x + 16 + label_col_w + i * col_w for i, key in enumerate(keys)}
+
+    header_y = panel_y + 40
+    header_rects = {}
+
+    for key in keys:
+        rect = pygame.Rect(col_x[key], header_y, col_w - 8, 28)
+        header_rects[key] = rect
+        colour = key_colours[key]
+        if key == selected_key:
+            pygame.draw.rect(screen, colour, rect, border_radius=6)
+            text_colour = (10, 10, 10)
+        else:
+            pygame.draw.rect(screen, colour, rect, 2, border_radius=6)
+            text_colour = colour
+        lbl = font_label.render(display_names[key], True, text_colour)
+        screen.blit(lbl, (rect.centerx - lbl.get_width() // 2, rect.centery - lbl.get_height() // 2))
+
+    row_labels = ["Distance", "Nodes Explored", "Search Time", "Fuel Index", "Min Depth"]
+    row_y_start = header_y + 36
+    row_gap = 30
+
+    for ri, row_label in enumerate(row_labels):
+        ly = row_y_start + ri * row_gap
+        lbl = font_label.render(row_label, True, LABEL_COLOUR)
+        screen.blit(lbl, (panel_x + 16, ly))
+
+        for key in keys:
+            data = benchmark_results.get(key, {})
+            stats = data.get("stats") or {}
+            path = data.get("path")
+
+            if row_label == "Nodes Explored":
+                val_text, colour = str(data.get("nodes_explored", "—")), VALUE_COLOUR
+            elif row_label == "Search Time":
+                t = data.get("time_s")
+                val_text = f"{t * 1000:.1f} ms" if t is not None else "—"
+                colour = VALUE_COLOUR
+            elif not path:
+                val_text, colour = "no route", BAD_COLOUR
+            elif row_label == "Distance":
+                d = stats.get("distance_nm")
+                val_text, colour = (f"{d} nm" if d is not None else "—"), VALUE_COLOUR
+            elif row_label == "Fuel Index":
+                f = stats.get("fuel_index")
+                val_text = f"{f:.3f}" if f is not None else "—"
+                colour = _fuel_colour(f) if f is not None else VALUE_COLOUR
+            else:  # Min Depth
+                m = stats.get("min_depth_m")
+                val_text, colour = (f"{m} m" if m is not None else "no data"), _depth_colour(m)
+
+            val = font_value.render(val_text, True, colour)
+            screen.blit(val, (col_x[key] + (col_w - 8 - val.get_width()) // 2, ly))
+
+    note = font_label.render("Click a column to highlight that algorithm's route on the map",
+                              True, (100, 100, 120))
+    screen.blit(note, (panel_x + 12, panel_y + panel_h - 20))
+
+    return header_rects
+
+
 def draw_fuel_detail(screen, stats: dict, ship_factor: float):
     """
     Overlay panel showing fuel estimation breakdown.

@@ -30,6 +30,7 @@ from src.engine.router import (
     RouteParams, run_astar, run_multi_route, run_date_comparison, run_pareto_sweep,
     compute_route_stats, explain_route,
 )
+from src.engine.benchmark import run_benchmark
 from src.engine.exporter import export_csv, export_gpx
 
 clock = pygame.time.Clock()
@@ -312,6 +313,40 @@ def _draw_pareto_route(screen):
         )
 
 
+def _benchmark_thread_worker(params_base: RouteParams, result_queue: queue.Queue):
+    """
+    Runs benchmark.run_benchmark() (Phase 3C: Dijkstra/Greedy/A*) on a
+    background thread. No progress messages — each of the three full
+    searches here is comparable in cost to a single Calculate click, so
+    the existing "Searching..." spinner covers it without a cell-level
+    progress feed.
+    """
+    try:
+        results = run_benchmark(params_base)
+        result_queue.put({"type": "benchmark_done", "results": results})
+    except Exception as e:
+        logging.exception("Benchmark thread failed")
+        result_queue.put({"type": "error", "msg": str(e)})
+
+
+def _draw_benchmark_route(screen):
+    """Draw only the currently-selected benchmark algorithm's route on the map."""
+    data = _benchmark_results.get(_selected_benchmark_key)
+    if not data:
+        return
+    path = data.get("path")
+    if not path:
+        return
+    color = _BENCHMARK_ROUTE_COLORS.get(_selected_benchmark_key, WHITE)
+    for cell in path:
+        pygame.draw.rect(
+            screen, color,
+            (map_position[0] + cell[0] * grid_size,
+             map_position[1] + cell[1] * grid_size,
+             grid_size, grid_size),
+        )
+
+
 # Main loop state
 running = True
 path_found = False  # True once a route has been found
@@ -391,6 +426,19 @@ pareto_button_clicked = False
 
 PARETO_SWEEP_N = 20            # per the workplan's run_pareto_sweep(params, n=20)
 ROUTE_COLOR_PARETO = (230, 200, 60)   # gold — matches the frontier colour in draw_pareto_panel
+
+# --- Algorithm benchmark state (Phase 3C) ---
+_benchmark_results = {}        # {'dijkstra': {...}, 'greedy': {...}, 'astar': {...}} from benchmark.run_benchmark()
+_benchmark_active = False      # True → draw the benchmark table + selected algorithm's route instead of other panels
+_selected_benchmark_key = 'astar'  # which algorithm's route is highlighted on the map
+_benchmark_header_rects = {}   # last-drawn column rects from draw_benchmark_panel(), for click hit-testing
+benchmark_button_clicked = False
+
+_BENCHMARK_ROUTE_COLORS = {
+    "dijkstra": (120, 180, 255),
+    "greedy": (255, 150, 100),
+    "astar": (120, 230, 150),
+}
 
 
 def _astar_thread_worker(params: RouteParams, result_queue: queue.Queue):
@@ -509,6 +557,10 @@ while running:
                 pareto_button_clicked = True
                 exploration_done = False
 
+            if ui_elements.draw_benchmark_button(screen, _benchmark_active).collidepoint(event.pos):
+                benchmark_button_clicked = True
+                exploration_done = False
+
             if ui_elements.draw_reset_button(screen).collidepoint(event.pos):
                 # Reset all route state
                 selected_start = None
@@ -528,11 +580,16 @@ while running:
                 _pareto_active = False
                 _selected_pareto_index = 0
                 _pareto_point_rects = {}
+                _benchmark_results = {}
+                _benchmark_active = False
+                _selected_benchmark_key = 'astar'
+                _benchmark_header_rects = {}
                 path_found = False
                 exploration_done = False
                 start_button_clicked = False
                 compare_button_clicked = False
                 pareto_button_clicked = False
+                benchmark_button_clicked = False
                 _is_searching = False
                 background()
                 drawGrid()
@@ -578,6 +635,13 @@ while running:
                 for idx, rect in _pareto_point_rects.items():
                     if rect.collidepoint(event.pos):
                         _selected_pareto_index = idx
+                        break
+
+            # --- Benchmark panel column clicks (uses last-drawn header rects) ---
+            if _benchmark_active:
+                for key, rect in _benchmark_header_rects.items():
+                    if rect.collidepoint(event.pos):
+                        _selected_benchmark_key = key
                         break
 
             # --- Port selector arrows (only live while input boxes are shown) ---
@@ -643,6 +707,7 @@ while running:
             _compare_mode_active = False
             _date_diff_active = False
             _pareto_active = False
+            _benchmark_active = False
             _current_path = msg["path"]
             _route_stats = msg.get("stats", {})
 
@@ -667,6 +732,7 @@ while running:
             _compare_mode_active = True
             _date_diff_active = False
             _pareto_active = False
+            _benchmark_active = False
             _multi_routes = msg["results"]
             _selected_route_key = 'speed'
 
@@ -682,6 +748,7 @@ while running:
             _compare_mode_active = False
             _date_diff_active = True
             _pareto_active = False
+            _benchmark_active = False
             _date_diff_results = msg["results"]
 
             if any(r.get("path") for r in _date_diff_results.values()):
@@ -699,6 +766,7 @@ while running:
             _compare_mode_active = False
             _date_diff_active = False
             _pareto_active = True
+            _benchmark_active = False
             _pareto_results = msg["results"]
 
             # Default the selection to the first frontier point if any were
@@ -716,6 +784,22 @@ while running:
                 set_status(f"Pareto sweep ready — {len(frontier_indices)} frontier points, click one to compare")
             else:
                 set_status("Pareto sweep found no valid routes")
+
+        elif msg["type"] == "benchmark_done":
+            _is_searching = False
+            exploration_done = True
+            path_found = False
+            _compare_mode_active = False
+            _date_diff_active = False
+            _pareto_active = False
+            _benchmark_active = True
+            _benchmark_results = msg["results"]
+            _selected_benchmark_key = 'astar'
+
+            if any(r.get("path") for r in _benchmark_results.values()):
+                set_status("Benchmark ready — click a column to compare Dijkstra/Greedy/A*")
+            else:
+                set_status("Benchmark found no valid routes for any algorithm")
 
         elif msg["type"] == "error":
             _is_searching = False
@@ -751,6 +835,8 @@ while running:
         _draw_date_diff_routes(screen)
     elif _pareto_active:
         _draw_pareto_route(screen)
+    elif _benchmark_active:
+        _draw_benchmark_route(screen)
     elif _current_path:
         for cell in _current_path:
             pygame.draw.rect(
@@ -779,6 +865,7 @@ while running:
     ui_elements.draw_reset_button(screen)
     ui_elements.draw_compare_routes_button(screen, _compare_mode_active)
     ui_elements.draw_pareto_button(screen, _pareto_active)
+    ui_elements.draw_benchmark_button(screen, _benchmark_active)
     ui_elements.draw_date_selectors(screen)
 
     # Draw the "Calculate" button
@@ -1121,6 +1208,86 @@ while running:
             )
             _route_thread.start()
 
+    # -----------------------------------------------------------------------
+    # Launch algorithm benchmark (Phase 3C) when Algorithm Benchmark is clicked
+    # -----------------------------------------------------------------------
+    if benchmark_button_clicked and not exploration_done and not _is_searching:
+        benchmark_button_clicked = False  # consume the click
+
+        coords_ok = False
+        try:
+            if all(ui_elements.input_boxes):
+                start_longitude = float(ui_elements.input_boxes[0])
+                start_latitude = float(ui_elements.input_boxes[1])
+                end_longitude = float(ui_elements.input_boxes[2])
+                end_latitude = float(ui_elements.input_boxes[3])
+                start = (longitude_to_grid(start_longitude), latitude_to_grid(start_latitude))
+                end = (longitude_to_grid(end_longitude), latitude_to_grid(end_latitude))
+                if (0 <= start[0] < grid_width and 0 <= start[1] < grid_height and
+                        0 <= end[0] < grid_width and 0 <= end[1] < grid_height):
+                    start_x = start_longitude
+                    start_y = start_latitude
+                    end_x = end_longitude
+                    end_y = end_latitude
+                    coords_ok = True
+                else:
+                    set_status("Invalid start or end coordinates")
+            elif selected_start is not None and selected_end is not None:
+                start = selected_start
+                end = selected_end
+                start_y = grid_to_latitude(start[1])
+                start_x = grid_to_longitude(start[0])
+                end_y = grid_to_latitude(end[1])
+                end_x = grid_to_longitude(end[0])
+                coords_ok = True
+            else:
+                set_status("Please select start and end points")
+
+        except ValueError:
+            set_status("Please enter valid numbers for coordinates")
+
+        if coords_ok:
+            # mode is irrelevant here — benchmark.run_benchmark() uses its own
+            # Dijkstra/Greedy/A* cost functions, not calculate_fscore's modes.
+            params_base = RouteParams(
+                start=start,
+                end=end,
+                mode="speed",
+                land_cells=LAND_CELLS,
+                depth_grid=DEPTH_GRID,
+                ship_size_factor=get_ship_size_factor(),
+                min_depth=get_min_depth_for_vessel(),
+                draft=get_vessel_draft(),
+            )
+
+            # Clear previous results
+            _explored_cells.clear()
+            _current_path = None
+            _route_stats = {}
+            _route_explanation = ""
+            _multi_routes = {}
+            _compare_mode_active = False
+            _date_diff_results = {}
+            _date_diff_active = False
+            _pareto_results = []
+            _pareto_active = False
+            _pareto_point_rects = {}
+            _benchmark_results = {}
+            _benchmark_active = False
+            _benchmark_header_rects = {}
+            path_found = False
+            exploration_done = False
+            _is_searching = True
+
+            set_status("Running algorithm benchmark (Dijkstra / Greedy / A*)...")
+
+            _route_thread = threading.Thread(
+                target=_benchmark_thread_worker,
+                args=(params_base, _route_queue),
+                daemon=True,
+            )
+            _route_thread.start()
+
     # Draw comparison panel (multi-route), date-diff panel, Pareto scatter
     # panel, or single-route panel + explanation — mutually exclusive.
     if _compare_mode_active and _multi_routes:
@@ -1132,6 +1299,10 @@ while running:
     elif _pareto_active and _pareto_results:
         _pareto_point_rects = route_panel.draw_pareto_panel(
             screen, _pareto_results, _selected_pareto_index
+        )
+    elif _benchmark_active and _benchmark_results:
+        _benchmark_header_rects = route_panel.draw_benchmark_panel(
+            screen, _benchmark_results, _selected_benchmark_key
         )
     elif path_found and _route_stats:
         current_mode = "cargo" if cargo else ("passenger" if passenger else _get_individual_mode())

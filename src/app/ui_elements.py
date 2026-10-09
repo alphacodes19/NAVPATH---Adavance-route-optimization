@@ -658,6 +658,27 @@ def draw_pareto_button(screen, is_active=False):
     return button_rect
 
 
+def draw_benchmark_button(screen, is_active=False):
+    """
+    Trigger an algorithm benchmark (Dijkstra vs Greedy vs A*, Phase 3C) —
+    see src/engine/benchmark.py. Sits directly below the Pareto Sweep
+    button, same open column.
+    """
+    button_rect = pygame.Rect(1250, 515, 230, 40)
+    shadow_rect = button_rect.copy()
+    shadow_rect.topleft = (shadow_rect.x + 3, shadow_rect.y + 3)
+    pygame.draw.rect(screen, SHADOW_COLOR, shadow_rect, border_radius=8)
+    if is_active:
+        draw_gradient_button(screen, button_rect, (120, 200, 160), (70, 150, 110))
+    else:
+        draw_gradient_button(screen, button_rect, (40, 100, 80), (20, 70, 55))
+    font = get_font(22)
+    text = font.render("Algorithm Benchmark", True, BUTTON_TEXT_COLOR)
+    screen.blit(text, (button_rect.centerx - text.get_width() // 2,
+                        button_rect.centery - text.get_height() // 2))
+    return button_rect
+
+
 def draw_fuel_estimation_button(screen):
     """Toggle the fuel-estimation detail overlay (see src/app/route_panel.py)."""
     button_rect = pygame.Rect(670, 378, 560, 40)
