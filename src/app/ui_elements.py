@@ -636,6 +636,28 @@ def draw_compare_routes_button(screen, is_active=False):
     return button_rect
 
 
+def draw_pareto_button(screen, is_active=False):
+    """
+    Trigger a Pareto sweep (speed <-> fuel trade-off, Phase 3B) —
+    see router.run_pareto_sweep(). Sits below the vessel selector, in the
+    same open column (x=1250+) to the right of the already-packed
+    670-1230 control area.
+    """
+    button_rect = pygame.Rect(1250, 470, 230, 40)
+    shadow_rect = button_rect.copy()
+    shadow_rect.topleft = (shadow_rect.x + 3, shadow_rect.y + 3)
+    pygame.draw.rect(screen, SHADOW_COLOR, shadow_rect, border_radius=8)
+    if is_active:
+        draw_gradient_button(screen, button_rect, (230, 200, 60), (180, 150, 20))
+    else:
+        draw_gradient_button(screen, button_rect, (120, 100, 20), (90, 70, 10))
+    font = get_font(22)
+    text = font.render("Pareto Sweep", True, BUTTON_TEXT_COLOR)
+    screen.blit(text, (button_rect.centerx - text.get_width() // 2,
+                        button_rect.centery - text.get_height() // 2))
+    return button_rect
+
+
 def draw_fuel_estimation_button(screen):
     """Toggle the fuel-estimation detail overlay (see src/app/route_panel.py)."""
     button_rect = pygame.Rect(670, 378, 560, 40)

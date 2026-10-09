@@ -65,6 +65,7 @@ class RouteParams:
         min_depth: float = -10.0,
         heuristic_override: dict = None,
         draft: float = None,
+        pareto_blend: float = None,
     ):
         self.start = start
         self.end = end
@@ -84,6 +85,11 @@ class RouteParams:
         # (no vessel selected / Manual) keeps the old soft-penalty-only
         # behaviour unchanged.
         self.draft = draft
+        # Phase 3B: when mode == "pareto", calculate_fscore() blends the
+        # 'speed' and 'fuel' cost formulas by this [0, 1] weight instead of
+        # using a fixed formula — 0.0 = pure speed, 1.0 = pure fuel. Set by
+        # run_pareto_sweep() per run; irrelevant for every other mode.
+        self.pareto_blend = pareto_blend
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +133,29 @@ def _depth_penalty(cell: tuple, depth_grid: dict, min_depth: float) -> float:
     return 0.0
 
 
+def _fuel_score_for_cell(cell: tuple) -> float:
+    """
+    Fuel-efficiency score for a grid cell, converting to (lon, lat) first.
+
+    BUGFIX: run_astar() was previously calling
+    _fuel_retriever.retrieve_fuel_efficiency(neighbor[0], neighbor[1]) —
+    passing raw grid-cell integers (e.g. (50, 80)) straight into a lookup
+    keyed by real-world (longitude, latitude) floats like (68.875, 12.25).
+    Those never matched, so every neighbor silently fell back to the
+    retriever's default of 0, meaning "fuel" mode's fuel_score term
+    (calculate_fscore's `f *= (1 - 0.1 * fuel_score)`) was a no-op for the
+    entire lifetime of the app, and fuel_index in every stats dict was
+    computed the same way (see compute_route_stats/explain_route below —
+    same bug, same fix). _wind_alignment/_current_alignment/_heuristic_value
+    already did this conversion correctly; this brings fuel lookups in
+    line with them.
+    """
+    gx, gy = cell
+    lat = round_latitude(grid_to_latitude(gy))
+    lon = round_longitude(grid_to_longitude(gx))
+    return _fuel_retriever.retrieve_fuel_efficiency(lon, lat)
+
+
 def _heuristic_value(cell: tuple, pkl_path: str, heuristic_override: dict = None) -> float:
     gx, gy = cell
     lat = round_latitude(grid_to_latitude(gy))
@@ -150,6 +179,7 @@ def calculate_fscore(
     depth_pen: float,
     ship_factor: float,
     heuristic_override: dict = None,
+    blend_t: float = None,
 ) -> float:
     """
     Compute the A* f-score for a neighbor cell.
@@ -158,10 +188,20 @@ def calculate_fscore(
     The mode selects which weight combination to use. heuristic_override,
     when given, redirects every _heuristic_value() lookup below to a
     snapshot-day dict instead of the trained PKL (Phase 2C).
+
+    blend_t (Phase 3B, only used when mode == "pareto"): linearly blends
+    the 'speed' and 'fuel' formulas by this [0, 1] weight — 0.0 is pure
+    speed, 1.0 is pure fuel, values in between trace the distance/fuel
+    trade-off curve that run_pareto_sweep() sweeps across.
     """
     euclid = _euclidean(neighbor, end)
 
-    if mode == "cargo":
+    if mode == "pareto" and blend_t is not None:
+        f_speed = 0.3 * g + 0.7 * euclid + 0.1 * _heuristic_value(neighbor, config.HEURISTICS_PKL, heuristic_override)
+        f_fuel = 0.4 * g + 0.2 * euclid + 0.1 * _heuristic_value(neighbor, config.HEURISTICS_PKL, heuristic_override)
+        f_fuel *= (1 - 0.1 * fuel_score)
+        f = (1 - blend_t) * f_speed + blend_t * f_fuel
+    elif mode == "cargo":
         f = 0.3 * g + 0.7 * euclid + 0.1 * _heuristic_value(neighbor, config.CARGO_PKL, heuristic_override)
     elif mode == "passenger":
         f = 0.3 * g + 0.2 * euclid + 1.0 * _heuristic_value(neighbor, config.PASSENGER_PKL, heuristic_override)
@@ -276,9 +316,7 @@ def run_astar(
             return path, explored
 
         for neighbor, wind_align, current_align in get_neighbors(current, params):
-            fuel_score = _fuel_retriever.retrieve_fuel_efficiency(
-                neighbor[0], neighbor[1]
-            )
+            fuel_score = _fuel_score_for_cell(neighbor)
             depth_pen = _depth_penalty(
                 neighbor, params.depth_grid, params.min_depth
             )
@@ -288,6 +326,7 @@ def run_astar(
                 params.mode, wind_align, current_align,
                 fuel_score, depth_pen, params.ship_size_factor,
                 heuristic_override=params.heuristic_override,
+                blend_t=params.pareto_blend,
             )
 
             if neighbor not in g_score or tentative_g < g_score[neighbor]:
@@ -388,6 +427,76 @@ def run_date_comparison(
 
 
 # ---------------------------------------------------------------------------
+# Pareto sweep — distance/fuel trade-off frontier (Phase 3B)
+# ---------------------------------------------------------------------------
+def run_pareto_sweep(
+    params_base: RouteParams,
+    n: int = 20,
+    run_progress_callback: Optional[Callable] = None,
+) -> list:
+    """
+    Run A* n times at evenly-spaced blends between the 'speed' and 'fuel'
+    cost formulas (see calculate_fscore's blend_t), tracing out the
+    distance-vs-fuel trade-off curve for this start/end/vessel.
+
+    These are the two objectives swept because they're the pair with the
+    clearest built-in tension in this model (fast-and-direct vs
+    fuel-efficient) and because calculate_fscore already has both formulas
+    defined; cargo/passenger/comfort aren't part of the sweep. Swap in a
+    different formula pair here if a different trade-off is wanted.
+
+    No per-cell progress_callback is passed to the individual run_astar()
+    calls — n full explorations would flood the UI's explored-cells queue
+    with mostly-overlapping data for little benefit. run_progress_callback,
+    if given, is called as run_progress_callback(i, n) after each of the n
+    runs completes (i is 1-based), so the caller can show "run i/n" instead.
+
+    Returns a list of n dicts, in t-ascending order:
+        {'t': float, 'path': [...] or None, 'stats': {...}, 'pareto_optimal': bool}
+    pareto_optimal marks the non-dominated frontier among runs that found a
+    path: lower distance_nm AND lower-or-equal fuel_index (or vice versa)
+    beats a point on both — such a point is excluded from the frontier.
+    Runs with no path found always get pareto_optimal=False.
+    """
+    n = max(2, n)
+    results = []
+
+    for i in range(n):
+        t = i / (n - 1)
+        params = copy.copy(params_base)
+        params.mode = "pareto"
+        params.pareto_blend = t
+
+        path, explored = run_astar(params, progress_callback=None)
+
+        if path:
+            stats = compute_route_stats(path, params.depth_grid, _fuel_retriever._index)
+        else:
+            stats = {}
+            logging.warning(f"run_pareto_sweep: no path found at t={t:.3f} (run {i + 1}/{n})")
+
+        results.append({"t": round(t, 4), "path": path, "stats": stats, "pareto_optimal": False})
+
+        if run_progress_callback:
+            run_progress_callback(i + 1, n)
+
+    # Mark the non-dominated frontier among runs that found a path.
+    valid_indices = [i for i, r in enumerate(results) if r["stats"]]
+    for i in valid_indices:
+        di = results[i]["stats"]["distance_nm"]
+        fi = results[i]["stats"]["fuel_index"]
+        dominated = any(
+            results[j]["stats"]["distance_nm"] <= di
+            and results[j]["stats"]["fuel_index"] <= fi
+            and (results[j]["stats"]["distance_nm"] < di or results[j]["stats"]["fuel_index"] < fi)
+            for j in valid_indices if j != i
+        )
+        results[i]["pareto_optimal"] = not dominated
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Route statistics
 # ---------------------------------------------------------------------------
 # Nautical miles per grid cell (approximate, based on ~0.25° resolution)
@@ -400,6 +509,13 @@ NM_PER_CELL_DIAGONAL = NM_PER_CELL_STRAIGHT * math.sqrt(2)
 def compute_route_stats(path: list, depth_grid: dict, fuel_grid: dict) -> dict:
     """
     Compute summary statistics for a completed route.
+
+    fuel_grid is expected to be _fuel_retriever._index — i.e. keyed by
+    (lon, lat), same as everywhere else in this module — so each path
+    cell is converted via grid_to_longitude/latitude before the lookup.
+    (BUGFIX: previously looked up fuel_grid.get((curr[0], curr[1]), 0.5),
+    i.e. by raw grid-cell integers against a lon/lat-keyed dict — see
+    _fuel_score_for_cell()'s docstring above for the full story.)
 
     Returns a dict with:
         distance_nm    — total distance in nautical miles
@@ -423,8 +539,10 @@ def compute_route_stats(path: list, depth_grid: dict, fuel_grid: dict) -> dict:
         is_diagonal = (dx == 1 and dy == 1)
         distance_nm += NM_PER_CELL_DIAGONAL if is_diagonal else NM_PER_CELL_STRAIGHT
 
-        # Fuel index accumulation
-        fs = fuel_grid.get((curr[0], curr[1]), 0.5)
+        # Fuel index accumulation (lon/lat lookup — see docstring above)
+        curr_lat = round_latitude(grid_to_latitude(curr[1]))
+        curr_lon = round_longitude(grid_to_longitude(curr[0]))
+        fs = fuel_grid.get((curr_lon, curr_lat), 0.5)
         fuel_index += fs
 
         # Depth tracking
@@ -448,6 +566,9 @@ def explain_route(path: list, depth_grid: dict, fuel_grid: dict,
     """
     Generate a one-paragraph explanation of what shaped this route.
     Used in the UI status area and the export file.
+
+    fuel_grid is _fuel_retriever._index (lon/lat-keyed) — see the lookup
+    bugfix note in _fuel_score_for_cell()'s docstring above.
     """
     if not path or len(path) < 2:
         return "No route to explain."
@@ -462,7 +583,9 @@ def explain_route(path: list, depth_grid: dict, fuel_grid: dict,
         if d is not None and d > -15:
             shallow_cells += 1
 
-        fs = fuel_grid.get(cell, 0.5)
+        cell_lat = round_latitude(grid_to_latitude(cell[1]))
+        cell_lon = round_longitude(grid_to_longitude(cell[0]))
+        fs = fuel_grid.get((cell_lon, cell_lat), 0.5)
         if fs < 0.35:
             low_fuel_cells += 1
         elif fs > 0.65:

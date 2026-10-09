@@ -371,6 +371,106 @@ def draw_date_diff_panel(screen, date_diff_results: dict, vessel_speed_knots: fl
     screen.blit(note, (panel_x + 12, panel_y + panel_h - 26))
 
 
+def draw_pareto_panel(screen, pareto_results: list, selected_index: int) -> dict:
+    """
+    Scatter plot of fuel_index (y) vs distance_nm (x) for each run in a
+    router.run_pareto_sweep() result list. Frontier (non-dominated) points
+    are drawn larger and gold, connected by a line; the currently selected
+    point is ringed in white. Reuses the same screen region as the other
+    panels (mutually exclusive with draw_route_panel/draw_comparison_panel/
+    draw_date_diff_panel).
+
+    Returns {index: pygame.Rect} — a small hit-box around each plotted
+    point, for main.py to hit-test clicks against and change which run's
+    route is drawn on the map (same click-to-select convention as
+    draw_comparison_panel's returned header_rects).
+    """
+    panel_x, panel_y, panel_w, panel_h = 670, 550, 560, 220
+
+    pygame.draw.rect(screen, PANEL_BORDER,
+                      (panel_x - 2, panel_y - 2, panel_w + 4, panel_h + 4),
+                      border_radius=10)
+    pygame.draw.rect(screen, PANEL_BG,
+                      (panel_x, panel_y, panel_w, panel_h),
+                      border_radius=10)
+
+    font_title = get_font(24)
+    font_label = get_font(16)
+
+    title = font_title.render("PARETO SWEEP — DISTANCE vs FUEL INDEX", True, TITLE_COLOUR)
+    screen.blit(title, (panel_x + 12, panel_y + 8))
+    pygame.draw.line(screen, PANEL_BORDER,
+                      (panel_x + 10, panel_y + 32),
+                      (panel_x + panel_w - 10, panel_y + 32))
+
+    point_rects = {}
+    valid = [(i, r) for i, r in enumerate(pareto_results) if r.get("stats")]
+    if not valid:
+        note = font_label.render("No valid routes found in this sweep", True, BAD_COLOUR)
+        screen.blit(note, (panel_x + 16, panel_y + 60))
+        return point_rects
+
+    dists = [r["stats"]["distance_nm"] for _, r in valid]
+    fuels = [r["stats"]["fuel_index"] for _, r in valid]
+    d_min, d_max = min(dists), max(dists)
+    f_min, f_max = min(fuels), max(fuels)
+    d_span = (d_max - d_min) or 1.0
+    f_span = (f_max - f_min) or 1.0
+
+    plot_x = panel_x + 60
+    plot_y = panel_y + 46
+    plot_w = panel_w - 85
+    plot_h = panel_h - 98
+
+    pygame.draw.line(screen, (80, 100, 130), (plot_x, plot_y), (plot_x, plot_y + plot_h), 1)
+    pygame.draw.line(screen, (80, 100, 130), (plot_x, plot_y + plot_h),
+                      (plot_x + plot_w, plot_y + plot_h), 1)
+
+    def to_screen(d, f):
+        sx = plot_x + (d - d_min) / d_span * plot_w
+        sy = plot_y + plot_h - (f - f_min) / f_span * plot_h  # fuel increases upward
+        return sx, sy
+
+    frontier_pts = sorted(
+        (r["stats"]["distance_nm"], r["stats"]["fuel_index"])
+        for _, r in valid if r["pareto_optimal"]
+    )
+    if len(frontier_pts) >= 2:
+        screen_pts = [to_screen(d, f) for d, f in frontier_pts]
+        pygame.draw.lines(screen, (230, 200, 60), False, screen_pts, 2)
+
+    for i, r in valid:
+        d, f = r["stats"]["distance_nm"], r["stats"]["fuel_index"]
+        sx, sy = to_screen(d, f)
+        is_frontier = r["pareto_optimal"]
+        is_selected = (i == selected_index)
+        radius = 7 if is_selected else (6 if is_frontier else 4)
+        color = (230, 200, 60) if is_frontier else (100, 160, 220)
+        pygame.draw.circle(screen, color, (int(sx), int(sy)), radius)
+        if is_selected:
+            pygame.draw.circle(screen, WHITE, (int(sx), int(sy)), radius + 3, 2)
+        point_rects[i] = pygame.Rect(int(sx) - 8, int(sy) - 8, 16, 16)
+
+    x_label = font_label.render(f"Distance (nm): {d_min:.0f} – {d_max:.0f}", True, LABEL_COLOUR)
+    screen.blit(x_label, (plot_x, plot_y + plot_h + 6))
+    y_label = font_label.render(f"Fuel idx: {f_min:.3f} – {f_max:.3f} (↑ = worse)", True, LABEL_COLOUR)
+    screen.blit(y_label, (panel_x + 12, plot_y - 4))
+
+    sel = pareto_results[selected_index] if 0 <= selected_index < len(pareto_results) else None
+    if sel and sel.get("stats"):
+        s = sel["stats"]
+        frontier_tag = "  [frontier]" if sel["pareto_optimal"] else ""
+        info_colour = GOOD_COLOUR if sel["pareto_optimal"] else VALUE_COLOUR
+        info = font_label.render(
+            f"Selected: t={sel['t']:.2f} (0=speed, 1=fuel) · {s['distance_nm']} nm · "
+            f"fuel {s['fuel_index']:.3f}{frontier_tag}",
+            True, info_colour,
+        )
+        screen.blit(info, (panel_x + 12, panel_y + panel_h - 22))
+
+    return point_rects
+
+
 def draw_fuel_detail(screen, stats: dict, ship_factor: float):
     """
     Overlay panel showing fuel estimation breakdown.

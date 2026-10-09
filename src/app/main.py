@@ -16,6 +16,7 @@ from src import config
 from src.app import ui_elements
 from src.app import weather_display
 from src.app import route_panel
+from src.app import visual_layers
 from src.app.intro_animation import play_intro_animation
 from src.engine.coord_convert import (
     grid_to_latitude, grid_to_longitude, latitude_to_grid, longitude_to_grid,
@@ -26,7 +27,7 @@ from src.engine import depth_cells
 from src.engine import router as route_engine
 from src.engine import snapshot_heuristics
 from src.engine.router import (
-    RouteParams, run_astar, run_multi_route, run_date_comparison,
+    RouteParams, run_astar, run_multi_route, run_date_comparison, run_pareto_sweep,
     compute_route_stats, explain_route,
 )
 from src.engine.exporter import export_csv, export_gpx
@@ -208,6 +209,24 @@ def get_vessel_draft():
     return None
 
 
+def get_selected_heuristic_override():
+    """
+    The historical-date override currently selected via the "Historical
+    Date" selector (Phase 2C) — None when "Default (PKL)" is selected.
+    Shared by the Calculate launch block below and the heuristic-cost
+    heatmap layer (Phase 3A, src/app/visual_layers.py) so both always
+    agree on what's being shown. snapshot_heuristics.load_snapshot_heuristic()
+    caches by date internally, so calling this every frame for the
+    heatmap is cheap.
+    """
+    if ui_elements.date_selection == -1:
+        return None
+    dates = snapshot_heuristics.list_available_dates()
+    if ui_elements.date_selection < len(dates):
+        return snapshot_heuristics.load_snapshot_heuristic(dates[ui_elements.date_selection])
+    return None
+
+
 def _get_individual_mode():
     """Read Fuel/Speed/Comfort button state and return mode string."""
     if ui_elements.horizontal_buttons[0]:
@@ -257,6 +276,40 @@ def _draw_date_diff_routes(screen):
                  map_position[1] + cell[1] * grid_size,
                  grid_size, grid_size),
             )
+
+
+def _pareto_thread_worker(params_base: RouteParams, n: int, result_queue: queue.Queue):
+    """
+    Runs run_pareto_sweep() (Phase 3B) on a background thread. No per-cell
+    progress is sent (see run_pareto_sweep's docstring) — instead a
+    "pareto_progress" message is queued after each of the n runs so
+    main.py can show "Pareto sweep: run i/n...".
+    """
+    def on_run_done(i, total):
+        result_queue.put({"type": "pareto_progress", "i": i, "n": total})
+
+    try:
+        results = run_pareto_sweep(params_base, n=n, run_progress_callback=on_run_done)
+        result_queue.put({"type": "pareto_done", "results": results})
+    except Exception as e:
+        logging.exception("Pareto sweep thread failed")
+        result_queue.put({"type": "error", "msg": str(e)})
+
+
+def _draw_pareto_route(screen):
+    """Draw only the currently-selected Pareto-sweep run's route on the map."""
+    if not (0 <= _selected_pareto_index < len(_pareto_results)):
+        return
+    path = _pareto_results[_selected_pareto_index].get("path")
+    if not path:
+        return
+    for cell in path:
+        pygame.draw.rect(
+            screen, ROUTE_COLOR_PARETO,
+            (map_position[0] + cell[0] * grid_size,
+             map_position[1] + cell[1] * grid_size,
+             grid_size, grid_size),
+        )
 
 
 # Main loop state
@@ -328,6 +381,16 @@ date_diff_button_clicked = False
 
 ROUTE_COLOR_DATE_A = (0, 200, 255)   # cyan
 ROUTE_COLOR_DATE_B = (255, 120, 0)   # orange
+
+# --- Pareto sweep state (Phase 3B) ---
+_pareto_results = []           # list from run_pareto_sweep(): [{'t','path','stats','pareto_optimal'}, ...]
+_pareto_active = False         # True → draw the scatter panel + selected run's route instead of other panels
+_selected_pareto_index = 0     # index into _pareto_results currently highlighted on the map
+_pareto_point_rects = {}       # last-drawn scatter-point rects from draw_pareto_panel(), for click hit-testing
+pareto_button_clicked = False
+
+PARETO_SWEEP_N = 20            # per the workplan's run_pareto_sweep(params, n=20)
+ROUTE_COLOR_PARETO = (230, 200, 60)   # gold — matches the frontier colour in draw_pareto_panel
 
 
 def _astar_thread_worker(params: RouteParams, result_queue: queue.Queue):
@@ -421,6 +484,14 @@ while running:
         if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE):
             running = False
 
+        # --- Visual layer toggles (Phase 3A) — keys 1-5 ---
+        # Only live when no coordinate/dimension input box is focused for
+        # typing, so "1".."5" still type into those boxes as digits when
+        # the user is actually entering a coordinate or ship dimension.
+        if (event.type == pygame.KEYDOWN and event.key != pygame.K_ESCAPE
+                and ui_elements.active_box is None and ui_elements.active_box2 is None):
+            visual_layers.handle_key_toggle(event.key)
+
         if event.type == pygame.MOUSEBUTTONDOWN:
             # --- Button clicks ---
             if ui_elements.draw_button(screen, show_input_boxes).collidepoint(event.pos):
@@ -432,6 +503,10 @@ while running:
 
             if ui_elements.draw_compare_routes_button(screen, _compare_mode_active).collidepoint(event.pos):
                 compare_button_clicked = True
+                exploration_done = False
+
+            if ui_elements.draw_pareto_button(screen, _pareto_active).collidepoint(event.pos):
+                pareto_button_clicked = True
                 exploration_done = False
 
             if ui_elements.draw_reset_button(screen).collidepoint(event.pos):
@@ -449,10 +524,15 @@ while running:
                 _comparison_header_rects = {}
                 _date_diff_results = {}
                 _date_diff_active = False
+                _pareto_results = []
+                _pareto_active = False
+                _selected_pareto_index = 0
+                _pareto_point_rects = {}
                 path_found = False
                 exploration_done = False
                 start_button_clicked = False
                 compare_button_clicked = False
+                pareto_button_clicked = False
                 _is_searching = False
                 background()
                 drawGrid()
@@ -491,6 +571,13 @@ while running:
                 for key, rect in _comparison_header_rects.items():
                     if rect.collidepoint(event.pos):
                         _selected_route_key = key
+                        break
+
+            # --- Pareto scatter-point clicks (uses last-drawn point rects) ---
+            if _pareto_active:
+                for idx, rect in _pareto_point_rects.items():
+                    if rect.collidepoint(event.pos):
+                        _selected_pareto_index = idx
                         break
 
             # --- Port selector arrows (only live while input boxes are shown) ---
@@ -555,6 +642,7 @@ while running:
             path_found = True
             _compare_mode_active = False
             _date_diff_active = False
+            _pareto_active = False
             _current_path = msg["path"]
             _route_stats = msg.get("stats", {})
 
@@ -578,6 +666,7 @@ while running:
             path_found = False
             _compare_mode_active = True
             _date_diff_active = False
+            _pareto_active = False
             _multi_routes = msg["results"]
             _selected_route_key = 'speed'
 
@@ -592,12 +681,41 @@ while running:
             path_found = False
             _compare_mode_active = False
             _date_diff_active = True
+            _pareto_active = False
             _date_diff_results = msg["results"]
 
             if any(r.get("path") for r in _date_diff_results.values()):
                 set_status("Date comparison ready — cyan = Date A, orange = Date B")
             else:
                 set_status("No route found for either date")
+
+        elif msg["type"] == "pareto_progress":
+            set_status(f"Pareto sweep: run {msg['i']}/{msg['n']}...")
+
+        elif msg["type"] == "pareto_done":
+            _is_searching = False
+            exploration_done = True
+            path_found = False
+            _compare_mode_active = False
+            _date_diff_active = False
+            _pareto_active = True
+            _pareto_results = msg["results"]
+
+            # Default the selection to the first frontier point if any were
+            # found, else just the first run that found a path at all.
+            frontier_indices = [i for i, r in enumerate(_pareto_results) if r.get("pareto_optimal")]
+            valid_indices = [i for i, r in enumerate(_pareto_results) if r.get("path")]
+            if frontier_indices:
+                _selected_pareto_index = frontier_indices[0]
+            elif valid_indices:
+                _selected_pareto_index = valid_indices[0]
+            else:
+                _selected_pareto_index = 0
+
+            if valid_indices:
+                set_status(f"Pareto sweep ready — {len(frontier_indices)} frontier points, click one to compare")
+            else:
+                set_status("Pareto sweep found no valid routes")
 
         elif msg["type"] == "error":
             _is_searching = False
@@ -610,6 +728,13 @@ while running:
     background()
     drawGrid()
     # foreground() no longer drawn here — see build_land_mask() above.
+
+    # --- Visual data layers (Phase 3A) — under the route, over the grid ---
+    visual_layers.draw_all(
+        screen, map_position, grid_size, LAND_CELLS, DEPTH_GRID,
+        heuristic_override=get_selected_heuristic_override(),
+    )
+    visual_layers.draw_legend(screen, map_position)
 
     # --- Persistent route drawing (driven by state, not by queue arrival) ---
     for cell in _explored_cells:
@@ -624,6 +749,8 @@ while running:
         _draw_multi_routes(screen)
     elif _date_diff_active:
         _draw_date_diff_routes(screen)
+    elif _pareto_active:
+        _draw_pareto_route(screen)
     elif _current_path:
         for cell in _current_path:
             pygame.draw.rect(
@@ -651,6 +778,7 @@ while running:
     ui_elements.draw_vessel_selector(screen)
     ui_elements.draw_reset_button(screen)
     ui_elements.draw_compare_routes_button(screen, _compare_mode_active)
+    ui_elements.draw_pareto_button(screen, _pareto_active)
     ui_elements.draw_date_selectors(screen)
 
     # Draw the "Calculate" button
@@ -720,13 +848,7 @@ while running:
             # Phase 2C-1/2C-2: if a historical date is selected (not "Default
             # (PKL)"), swap in that day's snapshot heuristic instead of the
             # trained PKL for this calculation.
-            heuristic_override = None
-            if ui_elements.date_selection != -1:
-                _dates = snapshot_heuristics.list_available_dates()
-                if ui_elements.date_selection < len(_dates):
-                    heuristic_override = snapshot_heuristics.load_snapshot_heuristic(
-                        _dates[ui_elements.date_selection]
-                    )
+            heuristic_override = get_selected_heuristic_override()
 
             params = RouteParams(
                 start=start,
@@ -922,13 +1044,95 @@ while running:
                 )
                 _route_thread.start()
 
-    # Draw comparison panel (multi-route), date-diff panel, or single-route panel + explanation
+    # -----------------------------------------------------------------------
+    # Launch Pareto sweep (Phase 3B) when Pareto Sweep is clicked
+    # -----------------------------------------------------------------------
+    if pareto_button_clicked and not exploration_done and not _is_searching:
+        pareto_button_clicked = False  # consume the click
+
+        coords_ok = False
+        try:
+            if all(ui_elements.input_boxes):
+                start_longitude = float(ui_elements.input_boxes[0])
+                start_latitude = float(ui_elements.input_boxes[1])
+                end_longitude = float(ui_elements.input_boxes[2])
+                end_latitude = float(ui_elements.input_boxes[3])
+                start = (longitude_to_grid(start_longitude), latitude_to_grid(start_latitude))
+                end = (longitude_to_grid(end_longitude), latitude_to_grid(end_latitude))
+                if (0 <= start[0] < grid_width and 0 <= start[1] < grid_height and
+                        0 <= end[0] < grid_width and 0 <= end[1] < grid_height):
+                    start_x = start_longitude
+                    start_y = start_latitude
+                    end_x = end_longitude
+                    end_y = end_latitude
+                    coords_ok = True
+                else:
+                    set_status("Invalid start or end coordinates")
+            elif selected_start is not None and selected_end is not None:
+                start = selected_start
+                end = selected_end
+                start_y = grid_to_latitude(start[1])
+                start_x = grid_to_longitude(start[0])
+                end_y = grid_to_latitude(end[1])
+                end_x = grid_to_longitude(end[0])
+                coords_ok = True
+            else:
+                set_status("Please select start and end points")
+
+        except ValueError:
+            set_status("Please enter valid numbers for coordinates")
+
+        if coords_ok:
+            # mode is overridden to "pareto" per-run inside run_pareto_sweep();
+            # "speed" here is just a placeholder so RouteParams has a valid default.
+            params_base = RouteParams(
+                start=start,
+                end=end,
+                mode="speed",
+                land_cells=LAND_CELLS,
+                depth_grid=DEPTH_GRID,
+                ship_size_factor=get_ship_size_factor(),
+                min_depth=get_min_depth_for_vessel(),
+                draft=get_vessel_draft(),
+            )
+
+            # Clear previous results
+            _explored_cells.clear()
+            _current_path = None
+            _route_stats = {}
+            _route_explanation = ""
+            _multi_routes = {}
+            _compare_mode_active = False
+            _date_diff_results = {}
+            _date_diff_active = False
+            _pareto_results = []
+            _pareto_active = False
+            _pareto_point_rects = {}
+            path_found = False
+            exploration_done = False
+            _is_searching = True
+
+            set_status(f"Running Pareto sweep (0/{PARETO_SWEEP_N})...")
+
+            _route_thread = threading.Thread(
+                target=_pareto_thread_worker,
+                args=(params_base, PARETO_SWEEP_N, _route_queue),
+                daemon=True,
+            )
+            _route_thread.start()
+
+    # Draw comparison panel (multi-route), date-diff panel, Pareto scatter
+    # panel, or single-route panel + explanation — mutually exclusive.
     if _compare_mode_active and _multi_routes:
         _comparison_header_rects = route_panel.draw_comparison_panel(
             screen, _multi_routes, _selected_route_key
         )
     elif _date_diff_active and _date_diff_results:
         route_panel.draw_date_diff_panel(screen, _date_diff_results)
+    elif _pareto_active and _pareto_results:
+        _pareto_point_rects = route_panel.draw_pareto_panel(
+            screen, _pareto_results, _selected_pareto_index
+        )
     elif path_found and _route_stats:
         current_mode = "cargo" if cargo else ("passenger" if passenger else _get_individual_mode())
         route_panel.draw_route_panel(screen, _route_stats, current_mode)
