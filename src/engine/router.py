@@ -552,6 +552,29 @@ def build_voyage_timeline(path: list, stats: dict, speed_kn: float) -> list:
     return timeline
 
 
+def estimate_fuel_cost(
+    stats: dict,
+    price_per_litre: float,
+    litres_per_fuel_index: float = 2.5,
+) -> float:
+    """
+    Estimate fuel cost in rupees using the route's relative fuel index.
+
+    NOTE:
+    litres_per_fuel_index is a calibration assumption, not a measured
+    physical fuel-consumption rate. Calibrate it against real vessel data.
+    """
+    fuel_index = float(stats.get("fuel_index", 0) or 0)
+    price = float(price_per_litre)
+    litres_per_index = float(litres_per_fuel_index)
+
+    if price < 0 or litres_per_index < 0:
+        raise ValueError("Fuel price and calibration factor must be non-negative.")
+
+    estimated_litres = fuel_index * litres_per_index
+    return estimated_litres * price
+
+
 def compute_route_stats(path: list, depth_grid: dict, fuel_grid: dict) -> dict:
     """
     Compute summary statistics for a completed route.
