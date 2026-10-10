@@ -679,6 +679,38 @@ def draw_benchmark_button(screen, is_active=False):
     return button_rect
 
 
+def draw_voyage_button(screen, enabled: bool, is_active: bool = False):
+    """Draw the Phase 3D Start Voyage button in the right-hand control column.
+
+    The button is visually disabled until a single route is available. When a
+    voyage is already running, the label changes to make restarting explicit.
+    Returns the button rectangle for main.py hit-testing.
+    """
+    button_rect = pygame.Rect(1250, 560, 230, 40)
+    shadow_rect = button_rect.copy()
+    shadow_rect.topleft = (shadow_rect.x + 3, shadow_rect.y + 3)
+    pygame.draw.rect(screen, SHADOW_COLOR, shadow_rect, border_radius=8)
+
+    if not enabled:
+        draw_gradient_button(screen, button_rect, (85, 85, 85), (55, 55, 55))
+        label = "Route Required"
+    elif is_active:
+        draw_gradient_button(screen, button_rect, (20, 135, 145), (10, 95, 110))
+        label = "Restart Voyage"
+    else:
+        draw_gradient_button(screen, button_rect, (30, 170, 130), (15, 115, 90))
+        label = "Start Voyage"
+
+    font = get_font(22)
+    text = font.render(label, True, BUTTON_TEXT_COLOR)
+    screen.blit(
+        text,
+        (button_rect.centerx - text.get_width() // 2,
+         button_rect.centery - text.get_height() // 2),
+    )
+    return button_rect
+
+
 def draw_fuel_estimation_button(screen):
     """Toggle the fuel-estimation detail overlay (see src/app/route_panel.py)."""
     button_rect = pygame.Rect(670, 378, 560, 40)

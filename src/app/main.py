@@ -28,8 +28,9 @@ from src.engine import router as route_engine
 from src.engine import snapshot_heuristics
 from src.engine.router import (
     RouteParams, run_astar, run_multi_route, run_date_comparison, run_pareto_sweep,
-    compute_route_stats, explain_route,
+    build_voyage_timeline, compute_route_stats, explain_route,
 )
+from src.data.vessels import VESSELS
 from src.engine.benchmark import run_benchmark
 from src.engine.exporter import export_csv, export_gpx
 
@@ -395,6 +396,15 @@ _is_searching = False          # True while A* thread is alive
 _current_path = None           # the last successfully found path (single-route mode)
 _explored_cells = []           # cells to draw red (accumulated from queue)
 _route_stats = {}              # stats dict returned by compute_route_stats()
+
+# --- Voyage simulation state (Phase 3D) ---
+_voyage_timeline = []
+_voyage_active = False
+_voyage_paused = False
+_voyage_idx = 0.0
+_voyage_elapsed_hours = 0.0
+_voyage_speed_mult = 50.0
+_VOYAGE_SPEED_STEPS = (10.0, 50.0, 200.0, 1000.0)
 _route_explanation = ""        # human-readable summary of the last route
 _show_fuel_detail = False      # whether the fuel-estimation overlay is open
 
@@ -527,6 +537,204 @@ def _draw_multi_routes(screen):
             )
 
 
+# ---------------------------------------------------------------------------
+# Voyage Simulation (Phase 3D)
+# ---------------------------------------------------------------------------
+def _get_voyage_speed_kn():
+    """Get the selected vessel speed; Manual defaults to 14 knots."""
+    selected = getattr(ui_elements, "vessel_selection", -1)
+    if isinstance(selected, int) and 0 <= selected < len(VESSELS):
+        return float(VESSELS[selected].get("speed_kn", 14.0))
+    return 14.0
+
+
+def _reset_voyage():
+    """Clear simulation state when the route is cleared or recalculated."""
+    global _voyage_timeline, _voyage_active, _voyage_paused
+    global _voyage_idx, _voyage_elapsed_hours
+    _voyage_timeline = []
+    _voyage_active = False
+    _voyage_paused = False
+    _voyage_idx = 0.0
+    _voyage_elapsed_hours = 0.0
+
+
+def start_voyage():
+    """Start or restart a simulation for the currently computed route."""
+    global _voyage_timeline, _voyage_active, _voyage_paused
+    global _voyage_idx, _voyage_elapsed_hours
+
+    if not _current_path:
+        set_status("Calculate a route before starting the voyage")
+        return False
+
+    speed_kn = _get_voyage_speed_kn()
+    _voyage_timeline = build_voyage_timeline(
+        _current_path, _route_stats, speed_kn
+    )
+
+    if not _voyage_timeline:
+        set_status("Cannot simulate an empty route")
+        return False
+
+    _voyage_idx = 0.0
+    _voyage_elapsed_hours = 0.0
+    _voyage_active = True
+    _voyage_paused = False
+    set_status(
+        f"Voyage started at {speed_kn:.1f} knots "
+        f"({ _voyage_speed_mult:.0f}x simulation speed)"
+    )
+    return True
+
+
+def update_voyage(dt_seconds):
+    """Advance the simulation clock and interpolate the position by time."""
+    global _voyage_idx, _voyage_elapsed_hours
+    global _voyage_active, _voyage_paused
+
+    if not _voyage_active or _voyage_paused or not _voyage_timeline:
+        return
+    if dt_seconds <= 0:
+        return
+
+    last_idx = len(_voyage_timeline) - 1
+    total_hours = _voyage_timeline[-1]["hours_elapsed"]
+
+    if last_idx == 0 or total_hours <= 0:
+        _voyage_idx = float(last_idx)
+        _voyage_active = False
+        _voyage_paused = False
+        set_status("Voyage completed — destination reached")
+        return
+
+    _voyage_elapsed_hours += dt_seconds * _voyage_speed_mult / 3600.0
+
+    if _voyage_elapsed_hours >= total_hours:
+        _voyage_elapsed_hours = total_hours
+        _voyage_idx = float(last_idx)
+        _voyage_active = False
+        _voyage_paused = False
+        set_status("Voyage completed — destination reached")
+        return
+
+    # Locate the path segment containing the current simulated time.
+    i0 = min(int(_voyage_idx), last_idx - 1)
+    while (
+        i0 < last_idx - 1
+        and _voyage_timeline[i0 + 1]["hours_elapsed"] < _voyage_elapsed_hours
+    ):
+        i0 += 1
+
+    h0 = _voyage_timeline[i0]["hours_elapsed"]
+    h1 = _voyage_timeline[i0 + 1]["hours_elapsed"]
+    segment_hours = h1 - h0
+
+    if segment_hours > 0:
+        fraction = (_voyage_elapsed_hours - h0) / segment_hours
+        fraction = max(0.0, min(1.0, fraction))
+    else:
+        fraction = 0.0
+
+    _voyage_idx = i0 + fraction
+
+
+def _get_voyage_display_state():
+    """Return the interpolated map position and live voyage statistics."""
+    if not _voyage_timeline:
+        return None
+
+    last_idx = len(_voyage_timeline) - 1
+    idx = max(0.0, min(_voyage_idx, float(last_idx)))
+    i0 = int(idx)
+    i1 = min(i0 + 1, last_idx)
+    fraction = idx - i0
+    first = _voyage_timeline[i0]
+    second = _voyage_timeline[i1]
+
+    x0, y0 = first["pos"]
+    x1, y1 = second["pos"]
+
+    def interpolate(key):
+        return first[key] + (second[key] - first[key]) * fraction
+
+    return {
+        "x": x0 + (x1 - x0) * fraction,
+        "y": y0 + (y1 - y0) * fraction,
+        "nm_covered": interpolate("nm_covered"),
+        "hours_elapsed": interpolate("hours_elapsed"),
+        "total_nm": _voyage_timeline[-1]["nm_covered"],
+        "total_hours": _voyage_timeline[-1]["hours_elapsed"],
+    }
+
+
+def draw_voyage_ship(target_screen):
+    """Draw the ship marker at its interpolated grid position."""
+    state = _get_voyage_display_state()
+    if state is None:
+        return
+
+    screen_x = map_position[0] + (state["x"] + 0.5) * grid_size
+    screen_y = map_position[1] + (state["y"] + 0.5) * grid_size
+    center = (int(screen_x), int(screen_y))
+
+    pygame.draw.circle(target_screen, (255, 255, 255), center, 7)
+    pygame.draw.circle(target_screen, (0, 150, 255), center, 7, 2)
+
+
+def draw_voyage_hud(target_screen):
+    """Display current voyage progress in a small top-right HUD."""
+    state = _get_voyage_display_state()
+    if state is None:
+        return
+
+    total_nm = state["total_nm"]
+    covered_nm = state["nm_covered"]
+    elapsed_hours = state["hours_elapsed"]
+    total_hours = state["total_hours"]
+    percentage = covered_nm / total_nm * 100.0 if total_nm > 0 else 100.0
+    remaining_hours = max(0.0, total_hours - elapsed_hours)
+
+    if _voyage_paused:
+        voyage_status = "Paused"
+    elif _voyage_active:
+        voyage_status = "In progress"
+    else:
+        voyage_status = "Complete"
+
+    lines = [
+        f"Voyage: {voyage_status}",
+        f"Progress: {percentage:.1f}%",
+        f"Distance: {covered_nm:.1f} / {total_nm:.1f} nm",
+        f"Elapsed: {elapsed_hours:.2f} hrs",
+        f"ETA remaining: {remaining_hours:.2f} hrs",
+        f"Simulation speed: {_voyage_speed_mult:.0f}x",
+    ]
+
+    # fuel_index is a relative route score, not a measured burn rate.
+    fuel_index = _route_stats.get("fuel_index")
+    if isinstance(fuel_index, (int, float)):
+        lines.append(f"Relative fuel index: {fuel_index:.3f}")
+
+    line_height = 24
+    panel_width = 310
+    panel_height = len(lines) * line_height + 16
+    panel_x = max(20, target_screen.get_width() - panel_width - 20)
+    panel_y = 20
+
+    panel = pygame.Surface((panel_width, panel_height), pygame.SRCALPHA)
+    panel.fill((15, 25, 40, 210))
+    target_screen.blit(panel, (panel_x, panel_y))
+
+    font = ui_elements.get_font(20)
+    for index, line in enumerate(lines):
+        text_surface = font.render(line, True, (255, 255, 255))
+        target_screen.blit(
+            text_surface,
+            (panel_x + 10, panel_y + 8 + index * line_height),
+        )
+
+
 while running:
     for event in pygame.event.get():
         if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE):
@@ -539,6 +747,30 @@ while running:
         if (event.type == pygame.KEYDOWN and event.key != pygame.K_ESCAPE
                 and ui_elements.active_box is None and ui_elements.active_box2 is None):
             visual_layers.handle_key_toggle(event.key)
+
+            # Temporary keyboard start until the dedicated UI button is wired.
+            if event.key == pygame.K_v:
+                start_voyage()
+            elif event.key == pygame.K_SPACE:
+                if _voyage_active and _voyage_timeline:
+                    _voyage_paused = not _voyage_paused
+                    set_status("Voyage paused" if _voyage_paused else "Voyage resumed")
+            elif event.key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
+                current_speed_index = min(
+                    range(len(_VOYAGE_SPEED_STEPS)),
+                    key=lambda i: abs(_VOYAGE_SPEED_STEPS[i] - _voyage_speed_mult),
+                )
+                next_speed_index = min(current_speed_index + 1, len(_VOYAGE_SPEED_STEPS) - 1)
+                _voyage_speed_mult = _VOYAGE_SPEED_STEPS[next_speed_index]
+                set_status(f"Simulation speed: {_voyage_speed_mult:.0f}x")
+            elif event.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
+                current_speed_index = min(
+                    range(len(_VOYAGE_SPEED_STEPS)),
+                    key=lambda i: abs(_VOYAGE_SPEED_STEPS[i] - _voyage_speed_mult),
+                )
+                next_speed_index = max(current_speed_index - 1, 0)
+                _voyage_speed_mult = _VOYAGE_SPEED_STEPS[next_speed_index]
+                set_status(f"Simulation speed: {_voyage_speed_mult:.0f}x")
 
         if event.type == pygame.MOUSEBUTTONDOWN:
             # --- Button clicks ---
@@ -561,11 +793,20 @@ while running:
                 benchmark_button_clicked = True
                 exploration_done = False
 
+            if ui_elements.draw_voyage_button(
+                screen, enabled=bool(_current_path), is_active=_voyage_active
+            ).collidepoint(event.pos):
+                if _current_path:
+                    start_voyage()
+                else:
+                    set_status("Calculate a route before starting the voyage")
+
             if ui_elements.draw_reset_button(screen).collidepoint(event.pos):
                 # Reset all route state
                 selected_start = None
                 selected_end = None
                 _current_path = None
+                _reset_voyage()
                 _explored_cells.clear()
                 _route_stats = {}
                 _route_explanation = ""
@@ -676,6 +917,9 @@ while running:
         if show_input_boxes:
             ui_elements.handle_input(event)
             ui_elements.handle_dir_input(event)
+
+    # Advance voyage time once per frame, using the previous frame duration.
+    update_voyage(clock.get_time() / 1000.0)
 
     # -----------------------------------------------------------------------
     # Drain the route queue — process messages from the A*/multi-route thread
@@ -856,6 +1100,11 @@ while running:
     else:
         weather_display.draw_weather_placeholder(screen, 970, 550, 240, 180, "Destination")
 
+    # Voyage marker and live HUD are drawn over the map/route.
+    if _voyage_timeline:
+        draw_voyage_ship(screen)
+        draw_voyage_hud(screen)
+
     ui_elements.draw_fuel_estimation_button(screen)
     ui_elements.draw_image_analysis_button(screen)
     ui_elements.draw_retrain_model_button(screen)
@@ -866,6 +1115,9 @@ while running:
     ui_elements.draw_compare_routes_button(screen, _compare_mode_active)
     ui_elements.draw_pareto_button(screen, _pareto_active)
     ui_elements.draw_benchmark_button(screen, _benchmark_active)
+    ui_elements.draw_voyage_button(
+        screen, enabled=bool(_current_path), is_active=_voyage_active
+    )
     ui_elements.draw_date_selectors(screen)
 
     # Draw the "Calculate" button
@@ -952,6 +1204,7 @@ while running:
             # Clear previous results
             _explored_cells.clear()
             _current_path = None
+            _reset_voyage()
             _route_stats = {}
             _route_explanation = ""
             _multi_routes = {}
@@ -1027,6 +1280,7 @@ while running:
             # Clear previous results
             _explored_cells.clear()
             _current_path = None
+            _reset_voyage()
             _route_stats = {}
             _route_explanation = ""
             _multi_routes = {}
@@ -1112,6 +1366,7 @@ while running:
                 # Clear previous results
                 _explored_cells.clear()
                 _current_path = None
+                _reset_voyage()
                 _route_stats = {}
                 _route_explanation = ""
                 _multi_routes = {}
@@ -1186,6 +1441,7 @@ while running:
             # Clear previous results
             _explored_cells.clear()
             _current_path = None
+            _reset_voyage()
             _route_stats = {}
             _route_explanation = ""
             _multi_routes = {}
@@ -1263,6 +1519,7 @@ while running:
             # Clear previous results
             _explored_cells.clear()
             _current_path = None
+            _reset_voyage()
             _route_stats = {}
             _route_explanation = ""
             _multi_routes = {}

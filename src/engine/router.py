@@ -505,6 +505,52 @@ def run_pareto_sweep(
 NM_PER_CELL_STRAIGHT = 15.0
 NM_PER_CELL_DIAGONAL = NM_PER_CELL_STRAIGHT * math.sqrt(2)
 
+def build_voyage_timeline(path: list, stats: dict, speed_kn: float) -> list:
+    """
+    Build cumulative distance and time data for voyage simulation.
+
+    Each entry contains:
+        pos: grid position (x, y)
+        nm_covered: cumulative nautical miles
+        hours_elapsed: simulated travel time from the start
+
+    speed_kn is vessel speed in knots (nautical miles/hour).
+    This function contains no pygame dependencies.
+    """
+    if not path:
+        return []
+
+    speed = float(speed_kn) if speed_kn is not None else 0.0
+
+    timeline = []
+    cumulative_nm = 0.0
+
+    for i, cell in enumerate(path):
+        if i > 0:
+            previous = path[i - 1]
+
+            dx = abs(cell[0] - previous[0])
+            dy = abs(cell[1] - previous[1])
+
+            if dx == 0 or dy == 0:
+                cumulative_nm += NM_PER_CELL_STRAIGHT
+            else:
+                cumulative_nm += NM_PER_CELL_DIAGONAL
+
+        hours_elapsed = (
+            cumulative_nm / speed
+            if speed > 0
+            else 0.0
+        )
+
+        timeline.append({
+            "pos": cell,
+            "nm_covered": cumulative_nm,
+            "hours_elapsed": hours_elapsed,
+        })
+
+    return timeline
+
 
 def compute_route_stats(path: list, depth_grid: dict, fuel_grid: dict) -> dict:
     """
