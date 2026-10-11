@@ -404,6 +404,11 @@ _emergency_running = False
 _emergency_request_id = 0
 _last_params_base = None
 
+# --- No-go zones (Phase 3G) ---
+_nogo_cells = set()          # Grid cells forbidden for future route calculations
+_painting_nogo = False       # True while right mouse button is held
+_erasing_nogo = False        # Shift + right-click erases cells
+
 # --- Fuel Price Slider (Phase 3E) ---
 fuel_price_slider = ui_elements.Slider(
     x=1250,
@@ -893,6 +898,78 @@ def draw_emergency_route(target_screen, result):
     target_screen.blit(label_surface, label_rect)
 
 
+# ---------------------------------------------------------------------------
+# No-go Zones (Phase 3G): right-click to paint, Shift+right-click to erase
+# ---------------------------------------------------------------------------
+def screen_to_grid(screen_pos):
+    """Convert a screen pixel position to a grid cell, or None outside the map."""
+    screen_x, screen_y = screen_pos
+    map_left, map_top = map_position
+    map_right = map_left + 550
+    map_bottom = map_top + 600
+
+    if not (map_left <= screen_x < map_right and map_top <= screen_y < map_bottom):
+        return None
+
+    grid_x = int((screen_x - map_left) // grid_size)
+    grid_y = int((screen_y - map_top) // grid_size)
+
+    if not (0 <= grid_x < grid_width // grid_size and
+            0 <= grid_y < grid_height // grid_size):
+        return None
+
+    return grid_x, grid_y
+
+
+def _paint_nogo_cell_at(screen_pos, screen_to_grid_fn):
+    """Paint or erase the cell under the pointer, but only inside the map."""
+    cell = screen_to_grid_fn(screen_pos)
+    if cell is None:
+        return
+
+    if _erasing_nogo:
+        _nogo_cells.discard(cell)
+    else:
+        _nogo_cells.add(cell)
+
+
+def handle_nogo_event(event, screen_to_grid_fn):
+    """Handle right-button painting and Shift+right-button erasing."""
+    global _painting_nogo, _erasing_nogo
+
+    if event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
+        _painting_nogo = True
+        _erasing_nogo = bool(pygame.key.get_mods() & pygame.KMOD_SHIFT)
+        _paint_nogo_cell_at(event.pos, screen_to_grid_fn)
+
+    elif event.type == pygame.MOUSEMOTION and _painting_nogo:
+        _paint_nogo_cell_at(event.pos, screen_to_grid_fn)
+
+    elif event.type == pygame.MOUSEBUTTONUP and event.button == 3:
+        _painting_nogo = False
+        _erasing_nogo = False
+
+
+def draw_nogo_zones(target_screen, nogo_cells):
+    """Draw translucent red no-go cells above map layers and below route lines."""
+    if not nogo_cells:
+        return
+
+    overlay = pygame.Surface((550, 600), pygame.SRCALPHA)
+    overlay_cell = pygame.Surface((grid_size, grid_size), pygame.SRCALPHA)
+    overlay_cell.fill((255, 35, 35, 115))
+
+    for grid_x, grid_y in nogo_cells:
+        if (0 <= grid_x < grid_width // grid_size and
+                0 <= grid_y < grid_height // grid_size):
+            overlay.blit(
+                overlay_cell,
+                (grid_x * grid_size, grid_y * grid_size),
+            )
+
+    target_screen.blit(overlay, map_position)
+
+
 while running:
     for event in pygame.event.get():
         if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE):
@@ -900,6 +977,10 @@ while running:
             
         # Phase 3E: fuel-price slider interaction
         fuel_price_slider.handle_event(event)
+
+        # No-go painting continues while the pointer moves and ends on right-button release.
+        if event.type in (pygame.MOUSEMOTION, pygame.MOUSEBUTTONUP):
+            handle_nogo_event(event, screen_to_grid)
 
         # --- Visual layer toggles (Phase 3A) — keys 1-5 ---
         # Only live when no coordinate/dimension input box is focused for
@@ -1061,25 +1142,31 @@ while running:
             else:
                 ui_elements.handle_mouse_click(event)
 
-            # --- Map clicks ---
-            mouse_x, mouse_y = event.pos
-            if (map_position[0] <= mouse_x < map_position[0] + 550 and
-                    map_position[1] <= mouse_y < map_position[1] + 600):
-                grid_x = (mouse_x - map_position[0]) // grid_size
-                grid_y = (mouse_y - map_position[1]) // grid_size
+            # Process right-click painting after existing UI hit-testing so controls retain priority.
+            if event.button == 3:
+                handle_nogo_event(event, screen_to_grid)
 
-                if selected_start is None:
-                    if not is_black_pixel(grid_x, grid_y) and grid_y > 78:
-                        selected_start = (grid_x, grid_y)
+            # --- Map clicks ---
+            # Only left-clicks select route start/end points; right-clicks paint no-go cells.
+            if event.button == 1:
+                mouse_x, mouse_y = event.pos
+                if (map_position[0] <= mouse_x < map_position[0] + 550 and
+                        map_position[1] <= mouse_y < map_position[1] + 600):
+                    grid_x = (mouse_x - map_position[0]) // grid_size
+                    grid_y = (mouse_y - map_position[1]) // grid_size
+
+                    if selected_start is None:
+                        if not is_black_pixel(grid_x, grid_y) and grid_y > 78:
+                            selected_start = (grid_x, grid_y)
+                        else:
+                            set_status("The selected coordinate is invalid, please try again!")
+                    elif selected_end is None:
+                        if not is_black_pixel(grid_x, grid_y) and grid_y > 78:
+                            selected_end = (grid_x, grid_y)
+                        else:
+                            set_status("The selected coordinate is invalid, please try again!")
                     else:
-                        set_status("The selected coordinate is invalid, please try again!")
-                elif selected_end is None:
-                    if not is_black_pixel(grid_x, grid_y) and grid_y > 78:
-                        selected_end = (grid_x, grid_y)
-                    else:
-                        set_status("The selected coordinate is invalid, please try again!")
-                else:
-                    selected_start, selected_end = None, None
+                        selected_start, selected_end = None, None
 
         if show_input_boxes:
             ui_elements.handle_input(event)
@@ -1252,6 +1339,9 @@ while running:
         heuristic_override=get_selected_heuristic_override(),
     )
     visual_layers.draw_legend(screen, map_position)
+
+    # No-go hazard overlay sits above map/weather layers and below route lines.
+    draw_nogo_zones(screen, _nogo_cells)
 
     # --- Persistent route drawing (driven by state, not by queue arrival) ---
     for cell in _explored_cells:
