@@ -1,4 +1,5 @@
 import sys
+import copy
 import threading
 import queue
 import logging
@@ -397,6 +398,12 @@ _current_path = None           # the last successfully found path (single-route 
 _explored_cells = []           # cells to draw red (accumulated from queue)
 _route_stats = {}              # stats dict returned by compute_route_stats()
 
+# --- Emergency Routing (Phase 3F) ---
+_emergency_result = None
+_emergency_running = False
+_emergency_request_id = 0
+_last_params_base = None
+
 # --- Fuel Price Slider (Phase 3E) ---
 fuel_price_slider = ui_elements.Slider(
     x=1250,
@@ -748,6 +755,144 @@ def draw_voyage_hud(target_screen):
         )
 
 
+# ---------------------------------------------------------------------------
+# Emergency Routing (Phase 3F)
+# ---------------------------------------------------------------------------
+def _emergency_thread_worker(current_pos, params_base, request_id):
+    """Run emergency routing in a background thread without touching pygame."""
+    try:
+        result = route_engine.run_emergency_route(
+            current_pos,
+            params_base,
+            progress_callback=lambda cell: _route_queue.put({
+                "type": "explored",
+                "cell": cell,
+            }),
+        )
+        _route_queue.put({
+            "type": "emergency_done",
+            "result": result,
+            "request_id": request_id,
+        })
+    except Exception as exc:
+        logging.exception("Emergency routing failed")
+        _route_queue.put({
+            "type": "emergency_error",
+            "msg": str(exc),
+            "request_id": request_id,
+        })
+
+
+def trigger_emergency_route():
+    """Request a route from the current vessel position to a reachable port."""
+    global _emergency_running, _emergency_result, _emergency_request_id
+
+    if _is_searching:
+        set_status("Wait for the current route calculation to finish")
+        return
+
+    if _emergency_running:
+        set_status("Emergency routing is already running")
+        return
+
+    if _last_params_base is None:
+        set_status("Calculate a route before requesting emergency routing")
+        return
+
+    # Prefer the interpolated voyage position while a voyage is underway.
+    voyage_state = _get_voyage_display_state()
+    if voyage_state is not None and _voyage_active:
+        current_pos = (
+            int(round(voyage_state["x"])),
+            int(round(voyage_state["y"])),
+        )
+    elif _current_path:
+        # The route parameters preserve the original start position.
+        current_pos = _last_params_base.start
+    else:
+        set_status("No valid starting position for emergency routing")
+        return
+
+    _emergency_request_id += 1
+    request_id = _emergency_request_id
+    _emergency_result = None
+    _emergency_running = True
+
+    # Copy before the worker changes start/end/mode for emergency routing.
+    emergency_params = copy.copy(_last_params_base)
+    set_status("Finding the nearest reachable emergency port...")
+
+    threading.Thread(
+        target=_emergency_thread_worker,
+        args=(current_pos, emergency_params, request_id),
+        daemon=True,
+    ).start()
+
+
+def draw_emergency_route(target_screen, result):
+    """Draw the emergency route above normal map layers and label its port."""
+    if not result:
+        return
+
+    path = result.get("path") or []
+    if not path:
+        return
+
+    # Convert route grid cells to pixel centres on the existing map.
+    points = [
+        (
+            int(map_position[0] + (cell[0] + 0.5) * grid_size),
+            int(map_position[1] + (cell[1] + 0.5) * grid_size),
+        )
+        for cell in path
+    ]
+
+    emergency_red = (255, 55, 55)
+    if len(points) >= 2:
+        pygame.draw.lines(target_screen, emergency_red, False, points, 4)
+    elif points:
+        pygame.draw.circle(target_screen, emergency_red, points[0], 5)
+
+    # Mark the current position and the destination port.
+    if points:
+        pygame.draw.circle(target_screen, (255, 255, 255), points[0], 5)
+        pygame.draw.circle(target_screen, emergency_red, points[0], 5, 2)
+        pygame.draw.circle(target_screen, emergency_red, points[-1], 7)
+        pygame.draw.circle(target_screen, (255, 255, 255), points[-1], 7, 2)
+
+    port = result.get("port") or {}
+    port_name = port.get("name") or port.get("port_name") or "Nearest reachable port"
+    stats = result.get("stats") or {}
+    distance = stats.get("distance_nm", result.get("great_circle_nm", 0.0))
+    try:
+        distance_text = f"{float(distance):.1f} nm"
+    except (TypeError, ValueError):
+        distance_text = "distance unavailable"
+
+    label = f"EMERGENCY ROUTE  |  {port_name}  |  {distance_text}"
+    font = ui_elements.get_font(20)
+    label_surface = font.render(label, True, (255, 255, 255))
+
+    # Keep the label within the map width, truncating very long port names.
+    max_label_width = 530
+    if label_surface.get_width() > max_label_width:
+        while port_name and font.size(
+            f"EMERGENCY ROUTE  |  {port_name}...  |  {distance_text}"
+        )[0] > max_label_width:
+            port_name = port_name[:-1]
+        label = f"EMERGENCY ROUTE  |  {port_name}...  |  {distance_text}"
+        label_surface = font.render(label, True, (255, 255, 255))
+
+    label_rect = label_surface.get_rect(
+        topleft=(map_position[0] + 6, map_position[1] + 6)
+    )
+    panel_rect = label_rect.inflate(16, 10)
+    panel = pygame.Surface(panel_rect.size, pygame.SRCALPHA)
+    panel.fill((110, 0, 0, 225))
+    target_screen.blit(panel, panel_rect.topleft)
+    target_screen.blit(label_surface, label_rect)
+
+
 while running:
     for event in pygame.event.get():
         if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE):
@@ -787,6 +932,8 @@ while running:
                 next_speed_index = max(current_speed_index - 1, 0)
                 _voyage_speed_mult = _VOYAGE_SPEED_STEPS[next_speed_index]
                 set_status(f"Simulation speed: {_voyage_speed_mult:.0f}x")
+            elif event.key == pygame.K_e:
+                trigger_emergency_route()
 
         if event.type == pygame.MOUSEBUTTONDOWN:
             # --- Button clicks ---
@@ -823,6 +970,10 @@ while running:
                 selected_end = None
                 _current_path = None
                 _reset_voyage()
+                _emergency_request_id += 1
+                _emergency_result = None
+                _emergency_running = False
+                _last_params_base = None
                 _explored_cells.clear()
                 _route_stats = {}
                 _route_explanation = ""
@@ -1061,6 +1212,28 @@ while running:
             else:
                 set_status("Benchmark found no valid routes for any algorithm")
 
+        elif msg["type"] == "emergency_done":
+            # Ignore results from an older request after a reset or new route.
+            if msg.get("request_id") == _emergency_request_id:
+                _emergency_running = False
+                _emergency_result = msg.get("result")
+
+                if _emergency_result:
+                    port = _emergency_result["port"]
+                    distance = _emergency_result["stats"].get("distance_nm", "unknown")
+                    set_status(
+                        f"Emergency route ready: {port.get('name', 'Nearest port')} "
+                        f"· {distance} nm"
+                    )
+                else:
+                    set_status("No reachable emergency port was found")
+
+        elif msg["type"] == "emergency_error":
+            if msg.get("request_id") == _emergency_request_id:
+                _emergency_running = False
+                _emergency_result = None
+                set_status(f"Emergency routing failed: {msg.get('msg', 'Unknown error')}")
+
         elif msg["type"] == "error":
             _is_searching = False
             exploration_done = True
@@ -1241,6 +1414,12 @@ while running:
                 heuristic_override=heuristic_override,
                 draft=get_vessel_draft(),
             )
+
+            # Preserve the current route settings for emergency rerouting.
+            _last_params_base = params
+            _emergency_request_id += 1
+            _emergency_result = None
+            _emergency_running = False
 
             # Clear previous results
             _explored_cells.clear()
@@ -1638,6 +1817,10 @@ while running:
         dots = "." * ((elapsed_ms // 500) % 4)  # cycles 0→1→2→3 dots every 500ms
         searching_text = font.render(f"Searching{dots}", True, (255, 255, 100))
         screen.blit(searching_text, (map_position[0], map_position[1] - 35))
+
+    # Emergency route is the top-most map overlay (Phase 3F).
+    if _emergency_result:
+        draw_emergency_route(screen, _emergency_result)
 
     pygame.display.flip()
     clock.tick(30)
