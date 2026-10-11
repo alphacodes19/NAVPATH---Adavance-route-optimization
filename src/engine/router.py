@@ -124,6 +124,12 @@ class RouteParams:
 
         nogo_cells: set = None,
 
+        # Phase 3H: environmental influence multipliers (0 to 2).
+
+        wind_scale: float = 1.0,
+
+        current_scale: float = 1.0,
+
     ):
 
         self.start = start
@@ -167,6 +173,11 @@ class RouteParams:
         # operations are reflected in subsequent neighbor checks.
 
         self.nogo_cells = nogo_cells if nogo_cells is not None else set()
+
+        # Phase 3H: 0 disables environmental influence, 1 preserves the
+        # current formula, and 2 doubles the influence.
+        self.wind_scale = max(0.0, min(2.0, float(wind_scale)))
+        self.current_scale = max(0.0, min(2.0, float(current_scale)))
 
         # Phase 3B: when mode == "pareto", calculate_fscore() blends the
 
@@ -328,6 +339,10 @@ def calculate_fscore(
 
     blend_t: float = None,
 
+    wind_scale: float = 1.0,
+
+    current_scale: float = 1.0,
+
 ) -> float:
 
     """
@@ -400,19 +415,13 @@ def calculate_fscore(
 
     f *= ship_factor
 
-    # Wind and current: continuous discount/penalty
-
-    # factor = 1.15 - 0.30 * alignment
-
-    #   alignment=1.0 (tailwind)  → factor=0.85 (15% cheaper)
-
-    #   alignment=0.5 (cross)     → factor=1.00 (neutral)
-
-    #   alignment=0.0 (headwind)  → factor=1.15 (15% more expensive)
-
-    f *= (1.15 - 0.30 * wind_align)
-
-    f *= (1.15 - 0.30 * current_align)
+    # Wind/current influence is scaled around a neutral factor of 1.0.
+    # Multiplier 1.0 preserves the original formula; 0.0 removes the
+    # influence entirely; 2.0 doubles the discount/penalty.
+    wind_factor = 1.0 + wind_scale * (0.15 - 0.30 * wind_align)
+    current_factor = 1.0 + current_scale * (0.15 - 0.30 * current_align)
+    f *= wind_factor
+    f *= current_factor
 
     return f
 
@@ -592,6 +601,10 @@ def run_astar(
 
                 blend_t=params.pareto_blend,
 
+                wind_scale=params.wind_scale,
+
+                current_scale=params.current_scale,
+
             )
 
             if neighbor not in g_score or tentative_g < g_score[neighbor]:
@@ -607,6 +620,29 @@ def run_astar(
     logging.warning(f"A* found no path from {start} to {end}")
 
     return None, explored
+
+# ---------------------------------------------------------------------------
+
+# What-if routing (Phase 3H)
+
+# ---------------------------------------------------------------------------
+
+def run_astar_whatif(
+    params_base: RouteParams,
+    wind_mult: float = 1.0,
+    current_mult: float = 1.0,
+    progress_callback: Optional[Callable] = None,
+) -> tuple:
+    """Run A* with wind/current overrides without mutating base parameters.
+
+    Multipliers are clamped to [0, 2]. A value of 0 disables that influence,
+    1 preserves the existing cost formula, and 2 doubles it.
+    """
+    params = copy.copy(params_base)
+    params.wind_scale = max(0.0, min(2.0, float(wind_mult)))
+    params.current_scale = max(0.0, min(2.0, float(current_mult)))
+    return run_astar(params, progress_callback=progress_callback)
+
 
 # ---------------------------------------------------------------------------
 

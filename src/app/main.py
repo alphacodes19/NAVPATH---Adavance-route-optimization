@@ -1,4 +1,5 @@
 import sys
+import json
 import copy
 import threading
 import queue
@@ -34,6 +35,62 @@ from src.engine.router import (
 from src.data.vessels import VESSELS
 from src.engine.benchmark import run_benchmark
 from src.engine.exporter import export_csv, export_gpx
+
+
+class _FallbackSlider:
+    """Small Pygame slider fallback for projects whose ui_elements lacks Slider."""
+
+    def __init__(self, x, y, w, min_val, max_val, start_val, label, unit="", prefix=""):
+        if max_val <= min_val:
+            raise ValueError("max_val must be greater than min_val")
+        self.rect = pygame.Rect(int(x), int(y), int(w), 20)
+        self.min_val = float(min_val)
+        self.max_val = float(max_val)
+        self.value = max(self.min_val, min(self.max_val, float(start_val)))
+        self.label = label
+        self.unit = unit
+        self.prefix = prefix
+        self.dragging = False
+        self.just_released = False
+        self.handle_radius = 8
+
+    def _set_value_from_x(self, mouse_x):
+        fraction = (mouse_x - self.rect.x) / self.rect.w
+        fraction = max(0.0, min(1.0, fraction))
+        self.value = self.min_val + fraction * (self.max_val - self.min_val)
+
+    def handle_event(self, event):
+        if (event.type == pygame.MOUSEBUTTONDOWN and event.button == 1
+                and self.rect.inflate(0, 20).collidepoint(event.pos)):
+            self.dragging = True
+            self.just_released = False
+            self._set_value_from_x(event.pos[0])
+        elif event.type == pygame.MOUSEMOTION and self.dragging:
+            self._set_value_from_x(event.pos[0])
+        elif event.type == pygame.MOUSEBUTTONUP and event.button == 1 and self.dragging:
+            self._set_value_from_x(event.pos[0])
+            self.dragging = False
+            self.just_released = True
+
+    def draw(self, target_screen, font=None):
+        font = font or ui_elements.get_font(20)
+        center_y = self.rect.centery
+        pygame.draw.line(target_screen, (100, 100, 100),
+                         (self.rect.left, center_y), (self.rect.right, center_y), 5)
+        fraction = (self.value - self.min_val) / (self.max_val - self.min_val)
+        handle_x = int(self.rect.x + fraction * self.rect.w)
+        pygame.draw.circle(target_screen, (0, 150, 255),
+                           (handle_x, center_y), self.handle_radius)
+        pygame.draw.circle(target_screen, (255, 255, 255),
+                           (handle_x, center_y), self.handle_radius, 2)
+        text = font.render(
+            f"{self.label}: {self.prefix}{self.value:.1f}{self.unit}",
+            True, (255, 255, 255),
+        )
+        target_screen.blit(text, (self.rect.x, self.rect.y - 24))
+
+
+_Slider = getattr(ui_elements, "Slider", _FallbackSlider)
 
 clock = pygame.time.Clock()
 
@@ -408,9 +465,10 @@ _last_params_base = None
 _nogo_cells = set()          # Grid cells forbidden for future route calculations
 _painting_nogo = False       # True while right mouse button is held
 _erasing_nogo = False        # Shift + right-click erases cells
+_nogo_dirty = False          # Unsaved no-go-zone edits
 
 # --- Fuel Price Slider (Phase 3E) ---
-fuel_price_slider = ui_elements.Slider(
+fuel_price_slider = _Slider(
     x=1250,
     y=635,
     w=230,
@@ -421,6 +479,26 @@ fuel_price_slider = ui_elements.Slider(
     unit="/L",
     prefix="₹",
 )
+
+# --- What-if sliders (Phase 3H) ---
+wind_slider = _Slider(
+    x=1250, y=755, w=230,
+    min_val=0.0, max_val=2.0, start_val=1.0,
+    label="Wind Impact", unit="x",
+)
+current_slider = _Slider(
+    x=1250, y=815, w=230,
+    min_val=0.0, max_val=2.0, start_val=1.0,
+    label="Current Impact", unit="x",
+)
+draft_slider = _Slider(
+    x=1250, y=875, w=230,
+    min_val=2.0, max_val=20.0, start_val=8.0,
+    label="Draft", unit=" m",
+)
+_whatif_dirty = False
+_whatif_running = False
+_whatif_request_id = 0
 
 # --- Voyage simulation state (Phase 3D) ---
 _voyage_timeline = []
@@ -506,6 +584,79 @@ def _astar_thread_worker(params: RouteParams, result_queue: queue.Queue):
     except Exception as e:
         logging.exception("A* thread failed")
         result_queue.put({"type": "error", "msg": str(e)})
+
+
+def _whatif_thread_worker(params_base, wind_mult, current_mult, draft_m, request_id):
+    """Recalculate a single route with the selected what-if overrides."""
+    try:
+        params = copy.copy(params_base)
+        params.draft = float(draft_m)
+        params.wind_scale = float(wind_mult)
+        params.current_scale = float(current_mult)
+        # Snapshot user-painted forbidden cells for this specific search.
+        params.nogo_cells = set(getattr(params_base, "nogo_cells", None) or set())
+
+        path, explored = route_engine.run_astar_whatif(
+            params,
+            wind_mult=wind_mult,
+            current_mult=current_mult,
+            progress_callback=None,
+        )
+
+        stats = {}
+        if path:
+            stats = compute_route_stats(
+                path,
+                params.depth_grid,
+                route_engine._fuel_retriever._index,
+            )
+
+        _route_queue.put({
+            "type": "whatif_done",
+            "request_id": request_id,
+            "path": path,
+            "stats": stats,
+            "params": params,
+            "explored": explored,
+        })
+    except Exception as exc:
+        logging.exception("What-if route recalculation failed")
+        _route_queue.put({
+            "type": "whatif_error",
+            "request_id": request_id,
+            "msg": str(exc),
+        })
+
+
+def _maybe_start_whatif_recalculation():
+    """Launch at most one what-if A* job; slider changes are coalesced."""
+    global _whatif_dirty, _whatif_running, _whatif_request_id, _is_searching
+
+    if not _whatif_dirty or _whatif_running or _is_searching or _emergency_running:
+        return
+    if not _current_path or _last_params_base is None:
+        # Keep the dirty flag until a base route exists, e.g. sliders moved
+        # while the first normal search was still running.
+        return
+
+    _whatif_dirty = False
+    _whatif_running = True
+    _is_searching = True
+    _whatif_request_id += 1
+    request_id = _whatif_request_id
+
+    params_snapshot = copy.copy(_last_params_base)
+    params_snapshot.nogo_cells = set(_nogo_cells)
+    wind_value = float(wind_slider.value)
+    current_value = float(current_slider.value)
+    draft_value = float(draft_slider.value)
+
+    set_status("Recalculating route with what-if settings...")
+    threading.Thread(
+        target=_whatif_thread_worker,
+        args=(params_snapshot, wind_value, current_value, draft_value, request_id),
+        daemon=True,
+    ).start()
 
 
 def _multi_route_thread_worker(params_base: RouteParams, result_queue: queue.Queue):
@@ -923,19 +1074,25 @@ def screen_to_grid(screen_pos):
 
 def _paint_nogo_cell_at(screen_pos, screen_to_grid_fn):
     """Paint or erase the cell under the pointer, but only inside the map."""
+    global _nogo_dirty
+
     cell = screen_to_grid_fn(screen_pos)
     if cell is None:
         return
 
     if _erasing_nogo:
-        _nogo_cells.discard(cell)
+        if cell in _nogo_cells:
+            _nogo_cells.discard(cell)
+            _nogo_dirty = True
     else:
-        _nogo_cells.add(cell)
+        if cell not in _nogo_cells:
+            _nogo_cells.add(cell)
+            _nogo_dirty = True
 
 
 def handle_nogo_event(event, screen_to_grid_fn):
     """Handle right-button painting and Shift+right-button erasing."""
-    global _painting_nogo, _erasing_nogo
+    global _painting_nogo, _erasing_nogo, _nogo_dirty
 
     if event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
         _painting_nogo = True
@@ -948,6 +1105,8 @@ def handle_nogo_event(event, screen_to_grid_fn):
     elif event.type == pygame.MOUSEBUTTONUP and event.button == 3:
         _painting_nogo = False
         _erasing_nogo = False
+        if _nogo_dirty and save_nogo_zones():
+            _nogo_dirty = False
 
 
 def draw_nogo_zones(target_screen, nogo_cells):
@@ -970,6 +1129,81 @@ def draw_nogo_zones(target_screen, nogo_cells):
     target_screen.blit(overlay, map_position)
 
 
+# Store zones in the project data directory so they survive application restarts.
+NOGO_ZONES_FILE = Path(__file__).resolve().parents[2] / "data" / "nogo_zones.json"
+
+
+def save_nogo_zones():
+    """Persist painted no-go cells; return True only when the save succeeds."""
+    try:
+        NOGO_ZONES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = sorted([int(x), int(y)] for x, y in _nogo_cells)
+        temp_file = NOGO_ZONES_FILE.with_suffix(".json.tmp")
+        with temp_file.open("w", encoding="utf-8") as file:
+            json.dump(payload, file, indent=2)
+        temp_file.replace(NOGO_ZONES_FILE)
+        return True
+    except (OSError, TypeError, ValueError):
+        logging.exception("Unable to save no-go zones to %s", NOGO_ZONES_FILE)
+        return False
+
+
+def load_nogo_zones():
+    """Load saved no-go cells, ignoring malformed or out-of-map entries."""
+    global _nogo_cells
+
+    try:
+        with NOGO_ZONES_FILE.open("r", encoding="utf-8") as file:
+            payload = json.load(file)
+    except FileNotFoundError:
+        _nogo_cells = set()
+        return
+    except (OSError, json.JSONDecodeError):
+        logging.exception("Unable to load no-go zones from %s", NOGO_ZONES_FILE)
+        _nogo_cells = set()
+        return
+
+    loaded = set()
+    if isinstance(payload, list):
+        max_x = grid_width // grid_size
+        max_y = grid_height // grid_size
+        for item in payload:
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                continue
+            x, y = item
+            # Avoid silently accepting floats, strings, or booleans as grid indices.
+            if isinstance(x, bool) or isinstance(y, bool):
+                continue
+            if not isinstance(x, int) or not isinstance(y, int):
+                continue
+            if 0 <= x < max_x and 0 <= y < max_y:
+                loaded.add((x, y))
+
+    _nogo_cells = loaded
+    logging.info("Loaded %d saved no-go cells", len(_nogo_cells))
+
+
+def clear_nogo_zones():
+    """Clear all no-go zones and persist the empty set."""
+    global _nogo_dirty
+
+    if not _nogo_cells:
+        set_status("No-go zones are already clear")
+        return
+
+    _nogo_cells.clear()
+    _nogo_dirty = True
+    if save_nogo_zones():
+        _nogo_dirty = False
+        set_status("All no-go zones cleared and saved")
+    else:
+        set_status("No-go zones cleared, but saving failed")
+
+
+# Restore previously painted zones once, before entering the event loop.
+load_nogo_zones()
+
+
 while running:
     for event in pygame.event.get():
         if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE):
@@ -977,6 +1211,15 @@ while running:
             
         # Phase 3E: fuel-price slider interaction
         fuel_price_slider.handle_event(event)
+
+        # Phase 3H: what-if sliders mark one recalculation on mouse release.
+        _whatif_sliders = (wind_slider, current_slider, draft_slider)
+        for whatif_slider in _whatif_sliders:
+            whatif_slider.handle_event(event)
+        if any(slider.just_released for slider in _whatif_sliders):
+            for slider in _whatif_sliders:
+                slider.just_released = False
+            _whatif_dirty = True
 
         # No-go painting continues while the pointer moves and ends on right-button release.
         if event.type in (pygame.MOUSEMOTION, pygame.MOUSEBUTTONUP):
@@ -990,8 +1233,11 @@ while running:
                 and ui_elements.active_box is None and ui_elements.active_box2 is None):
             visual_layers.handle_key_toggle(event.key)
 
+            # Phase 3G: press C to clear every painted no-go zone.
+            if event.key == pygame.K_c:
+                clear_nogo_zones()
             # Temporary keyboard start until the dedicated UI button is wired.
-            if event.key == pygame.K_v:
+            elif event.key == pygame.K_v:
                 start_voyage()
             elif event.key == pygame.K_SPACE:
                 if _voyage_active and _voyage_timeline:
@@ -1055,6 +1301,9 @@ while running:
                 _emergency_result = None
                 _emergency_running = False
                 _last_params_base = None
+                _whatif_request_id += 1
+                _whatif_dirty = False
+                _whatif_running = False
                 _explored_cells.clear()
                 _route_stats = {}
                 _route_explanation = ""
@@ -1299,6 +1548,47 @@ while running:
             else:
                 set_status("Benchmark found no valid routes for any algorithm")
 
+        elif msg["type"] == "whatif_done":
+            if msg.get("request_id") == _whatif_request_id:
+                _whatif_running = False
+                _is_searching = False
+                exploration_done = True
+                new_path = msg.get("path")
+
+                if new_path:
+                    _current_path = new_path
+                    _route_stats = msg.get("stats", {})
+                    _last_params_base = msg.get("params")
+                    _explored_cells.clear()
+                    _route_explanation = explain_route(
+                        _current_path,
+                        DEPTH_GRID,
+                        route_engine._fuel_retriever._index,
+                        LAND_CELLS,
+                    )
+                    path_found = True
+                    _reset_voyage()
+                    _emergency_request_id += 1
+                    _emergency_result = None
+                    _emergency_running = False
+                    set_status(
+                        "What-if route updated — "
+                        f"{_route_stats.get('distance_nm', '?')} nm"
+                    )
+                else:
+                    # Retain the last valid route so a restrictive what-if
+                    # setting does not blank the map or lose the prior result.
+                    set_status(
+                        "No route found for these what-if settings; "
+                        "previous route retained"
+                    )
+
+        elif msg["type"] == "whatif_error":
+            if msg.get("request_id") == _whatif_request_id:
+                _whatif_running = False
+                _is_searching = False
+                set_status(f"What-if recalculation failed: {msg.get('msg', 'Unknown error')}")
+
         elif msg["type"] == "emergency_done":
             # Ignore results from an older request after a reset or new route.
             if msg.get("request_id") == _emergency_request_id:
@@ -1325,6 +1615,10 @@ while running:
             _is_searching = False
             exploration_done = True
             set_status(msg["msg"])
+
+    # Launch a pending what-if recalculation after any active search result
+    # has been processed. Several slider releases collapse into one latest run.
+    _maybe_start_whatif_recalculation()
 
     screen.blit(background_image, (0, 0))  # Draw the background image
 
@@ -1422,6 +1716,20 @@ while running:
         )
         screen.blit(note_surface, (1250, 698))
 
+    # --- What-if controls (Phase 3H) ---
+    wind_slider.draw(screen, ui_elements.get_font(20))
+    current_slider.draw(screen, ui_elements.get_font(20))
+    draft_slider.draw(screen, ui_elements.get_font(20))
+
+    if _whatif_running:
+        busy_font = ui_elements.get_font(18)
+        busy_surface = busy_font.render(
+            "Recalculating for what-if settings...",
+            True,
+            (255, 220, 100),
+        )
+        screen.blit(busy_surface, (1250, 915))
+
     ui_elements.draw_date_selectors(screen)
 
     # Draw the "Calculate" button
@@ -1503,10 +1811,14 @@ while running:
                 min_depth=get_min_depth_for_vessel(),
                 heuristic_override=heuristic_override,
                 draft=get_vessel_draft(),
+                nogo_cells=_nogo_cells,
             )
 
             # Preserve the current route settings for emergency rerouting.
             _last_params_base = params
+            _whatif_request_id += 1
+            _whatif_dirty = False
+            _whatif_running = False
             _emergency_request_id += 1
             _emergency_result = None
             _emergency_running = False
@@ -1585,6 +1897,7 @@ while running:
                 ship_size_factor=get_ship_size_factor(),
                 min_depth=get_min_depth_for_vessel(),
                 draft=get_vessel_draft(),
+                nogo_cells=_nogo_cells,
             )
 
             # Clear previous results
@@ -1671,6 +1984,7 @@ while running:
                     ship_size_factor=get_ship_size_factor(),
                     min_depth=get_min_depth_for_vessel(),
                     draft=get_vessel_draft(),
+                    nogo_cells=_nogo_cells,
                 )
 
                 # Clear previous results
@@ -1746,6 +2060,7 @@ while running:
                 ship_size_factor=get_ship_size_factor(),
                 min_depth=get_min_depth_for_vessel(),
                 draft=get_vessel_draft(),
+                nogo_cells=_nogo_cells,
             )
 
             # Clear previous results
@@ -1824,6 +2139,7 @@ while running:
                 ship_size_factor=get_ship_size_factor(),
                 min_depth=get_min_depth_for_vessel(),
                 draft=get_vessel_draft(),
+                nogo_cells=_nogo_cells,
             )
 
             # Clear previous results
@@ -1914,3 +2230,8 @@ while running:
 
     pygame.display.flip()
     clock.tick(30)
+
+# Persist no-go zones on application exit as a final safeguard.
+if _nogo_dirty and not save_nogo_zones():
+    logging.warning("Some no-go-zone changes may not have been saved")
+pygame.quit()
