@@ -14,8 +14,10 @@ from typing import Callable, Optional
 
 from src.engine.coord_convert import (
     grid_to_latitude, grid_to_longitude,
+    latitude_to_grid, longitude_to_grid,
     round_latitude, round_longitude,
 )
+from src.data.ports import PORTS
 from src.engine.heuristic_retriever import HeuristicRetriever
 from src.engine import wind_retriever as wind_retriever_module
 from src.engine import current_retriever as current_retriever_module
@@ -338,6 +340,179 @@ def run_astar(
     logging.warning(f"A* found no path from {start} to {end}")
     return None, explored
 
+
+# ---------------------------------------------------------------------------
+# Emergency Routing (Phase 3F)
+# ---------------------------------------------------------------------------
+
+def _haversine_nm(lat1, lon1, lat2, lon2):
+    """Calculate great-circle distance between two points in nautical miles."""
+    earth_radius_nm = 3440.065
+
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    delta_phi = math.radians(lat2 - lat1)
+    delta_lon = math.radians(lon2 - lon1)
+
+    a = (
+        math.sin(delta_phi / 2) ** 2
+        + math.cos(phi1)
+        * math.cos(phi2)
+        * math.sin(delta_lon / 2) ** 2
+    )
+
+    a = max(0.0, min(1.0, a))
+    return 2 * earth_radius_nm * math.asin(math.sqrt(a))
+
+
+def find_nearest_ports(current_lat, current_lon, n=5):
+    """
+    Return the n nearest ports as (port, distance_nm) tuples,
+    ordered from nearest to farthest.
+    """
+    scored = [
+        (
+            port,
+            _haversine_nm(
+                current_lat,
+                current_lon,
+                port["lat"],
+                port["lon"],
+            ),
+        )
+        for port in PORTS
+    ]
+
+    scored.sort(key=lambda item: item[1])
+    return scored[:max(1, int(n))]
+
+
+def _nearby_navigable_port_cells(port, params, max_radius=3, limit=4):
+    """
+    Find nearby navigable grid cells around a port's mapped position.
+
+    Port coordinates may map to land or shallow cells. Trying nearby
+    water cells avoids rejecting an otherwise reachable port merely
+    because its mapped grid cell is blocked.
+    """
+    port_x = longitude_to_grid(port["lon"])
+    port_y = latitude_to_grid(port["lat"])
+
+    candidates = []
+
+    for radius in range(max_radius + 1):
+        for x in range(port_x - radius, port_x + radius + 1):
+            for y in range(port_y - radius, port_y + radius + 1):
+
+                # Examine each cell only in its outermost search ring.
+                if max(abs(x - port_x), abs(y - port_y)) != radius:
+                    continue
+
+                cell = (x, y)
+
+                if not (0 <= x < GRID_COLS and 0 <= y < GRID_ROWS):
+                    continue
+
+                if cell in params.land_cells:
+                    continue
+
+                if cell in storage.Backup_black_cells:
+                    continue
+
+                # Apply the same hard draft restriction as normal routing.
+                if params.draft is not None:
+                    depth = params.depth_grid.get(cell)
+
+                    if (
+                        depth is not None
+                        and depth > -(params.draft + DRAFT_SAFETY_MARGIN_M)
+                    ):
+                        continue
+
+                candidates.append(cell)
+
+    candidates.sort(
+        key=lambda cell: math.hypot(
+            cell[0] - port_x,
+            cell[1] - port_y,
+        )
+    )
+
+    return candidates[:limit]
+
+
+def run_emergency_route(
+    current_grid_pos,
+    params_base,
+    progress_callback=None,
+):
+    """
+    Find the nearest reachable port using A*.
+
+    Tries the five nearest ports in order, allowing several nearby
+    navigable arrival cells for each port.
+
+    Returns a dictionary containing the port, route, route statistics,
+    straight-line distance to the port, and the route's arrival cell.
+
+    Returns None if no candidate port is reachable.
+    """
+    current_x, current_y = current_grid_pos
+
+    current_lat = grid_to_latitude(current_y)
+    current_lon = grid_to_longitude(current_x)
+
+    nearest_ports = find_nearest_ports(
+        current_lat,
+        current_lon,
+        n=5,
+    )
+
+    for port, great_circle_nm in nearest_ports:
+        arrival_cells = _nearby_navigable_port_cells(
+            port,
+            params_base,
+        )
+
+        for arrival_cell in arrival_cells:
+            emergency_params = copy.copy(params_base)
+
+            emergency_params.start = current_grid_pos
+            emergency_params.end = arrival_cell
+
+            # This project's existing comparison logic maps the
+            # risk-averse "safe" route to the comfort scoring formula.
+            emergency_params.mode = "comfort"
+
+            if arrival_cell == current_grid_pos:
+                path = [current_grid_pos]
+            else:
+                path, _ = run_astar(
+                    emergency_params,
+                    progress_callback=progress_callback,
+                )
+
+                if not path:
+                    continue
+
+                # run_astar returns the path without the starting cell.
+                path = [current_grid_pos] + path
+
+            stats = compute_route_stats(
+                path,
+                emergency_params.depth_grid,
+                _fuel_retriever._index,
+            )
+
+            return {
+                "port": port,
+                "path": path,
+                "stats": stats,
+                "great_circle_nm": great_circle_nm,
+                "arrival_cell": arrival_cell,
+            }
+
+    return None
 
 # ---------------------------------------------------------------------------
 # Multi-route comparison (Phase 2A)
