@@ -28,7 +28,7 @@ from src.engine import router as route_engine
 from src.engine import snapshot_heuristics
 from src.engine.router import (
     RouteParams, run_astar, run_multi_route, run_date_comparison, run_pareto_sweep,
-    build_voyage_timeline, compute_route_stats, explain_route,
+    build_voyage_timeline, compute_route_stats, estimate_fuel_cost, explain_route,
 )
 from src.data.vessels import VESSELS
 from src.engine.benchmark import run_benchmark
@@ -397,6 +397,19 @@ _current_path = None           # the last successfully found path (single-route 
 _explored_cells = []           # cells to draw red (accumulated from queue)
 _route_stats = {}              # stats dict returned by compute_route_stats()
 
+# --- Fuel Price Slider (Phase 3E) ---
+fuel_price_slider = ui_elements.Slider(
+    x=1250,
+    y=635,
+    w=230,
+    min_val=50,
+    max_val=150,
+    start_val=100,
+    label="Fuel Price",
+    unit="/L",
+    prefix="₹",
+)
+
 # --- Voyage simulation state (Phase 3D) ---
 _voyage_timeline = []
 _voyage_active = False
@@ -739,6 +752,9 @@ while running:
     for event in pygame.event.get():
         if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE):
             running = False
+            
+        # Phase 3E: fuel-price slider interaction
+        fuel_price_slider.handle_event(event)
 
         # --- Visual layer toggles (Phase 3A) — keys 1-5 ---
         # Only live when no coordinate/dimension input box is focused for
@@ -1118,6 +1134,31 @@ while running:
     ui_elements.draw_voyage_button(
         screen, enabled=bool(_current_path), is_active=_voyage_active
     )
+
+    # --- Fuel Price Slider and Estimated Cost (Phase 3E) ---
+    fuel_price_slider.draw(screen, ui_elements.get_font(20))
+
+    if _current_path and _route_stats:
+        estimated_cost = estimate_fuel_cost(
+            _route_stats,
+            fuel_price_slider.value,
+        )
+        cost_font = ui_elements.get_font(22, bold=True)
+        cost_surface = cost_font.render(
+            f"Estimated fuel cost: ₹{estimated_cost:,.0f}",
+            True,
+            (255, 220, 100),
+        )
+        screen.blit(cost_surface, (1250, 670))
+
+        note_font = ui_elements.get_font(16)
+        note_surface = note_font.render(
+            "Illustrative estimate; calibration pending",
+            True,
+            (190, 190, 190),
+        )
+        screen.blit(note_surface, (1250, 698))
+
     ui_elements.draw_date_selectors(screen)
 
     # Draw the "Calculate" button

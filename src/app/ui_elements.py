@@ -113,6 +113,128 @@ _VESSEL_SEL_H = 34
 _VESSEL_NAME_W = 220
 
 
+class Slider:
+    """Reusable draggable slider for NAVPATH UI controls."""
+
+    def __init__(
+        self,
+        x,
+        y,
+        w,
+        min_val,
+        max_val,
+        start_val,
+        label,
+        unit="",
+        prefix="",
+    ):
+        if max_val <= min_val:
+            raise ValueError("max_val must be greater than min_val")
+
+        self.rect = pygame.Rect(int(x), int(y), int(w), 20)
+        self.min_val = float(min_val)
+        self.max_val = float(max_val)
+        self.value = max(
+            self.min_val,
+            min(self.max_val, float(start_val)),
+        )
+        self.label = label
+        self.unit = unit
+        self.prefix = prefix
+        self.dragging = False
+        self.just_released = False
+        self.handle_radius = 8
+
+    def _set_value_from_x(self, mouse_x):
+        """Convert the mouse position into a clamped slider value."""
+        fraction = (mouse_x - self.rect.x) / self.rect.w
+        fraction = max(0.0, min(1.0, fraction))
+
+        self.value = (
+            self.min_val
+            + fraction * (self.max_val - self.min_val)
+        )
+
+    def handle_event(self, event):
+        """Handle mouse clicks, dragging, and release detection."""
+        if (
+            event.type == pygame.MOUSEBUTTONDOWN
+            and event.button == 1
+            and self.rect.inflate(0, 20).collidepoint(event.pos)
+        ):
+            self.dragging = True
+            self.just_released = False
+            self._set_value_from_x(event.pos[0])
+
+        elif (
+            event.type == pygame.MOUSEMOTION
+            and self.dragging
+        ):
+            self._set_value_from_x(event.pos[0])
+
+        elif (
+            event.type == pygame.MOUSEBUTTONUP
+            and event.button == 1
+            and self.dragging
+        ):
+            self._set_value_from_x(event.pos[0])
+            self.dragging = False
+            self.just_released = True
+
+    def draw(self, screen, font=None):
+        """Draw the slider track, handle, and current value."""
+        if font is None:
+            font = get_font(20)
+
+        # Track
+        track_y = self.rect.centery
+        pygame.draw.line(
+            screen,
+            (100, 100, 100),
+            (self.rect.left, track_y),
+            (self.rect.right, track_y),
+            5,
+        )
+
+        # Handle position
+        fraction = (
+            (self.value - self.min_val)
+            / (self.max_val - self.min_val)
+        )
+        handle_x = int(
+            self.rect.x + fraction * self.rect.w
+        )
+
+        pygame.draw.circle(
+            screen,
+            (0, 150, 255),
+            (handle_x, track_y),
+            self.handle_radius,
+        )
+        pygame.draw.circle(
+            screen,
+            (255, 255, 255),
+            (handle_x, track_y),
+            self.handle_radius,
+            2,
+        )
+
+        # Label and value
+        label_text = (
+            f"{self.label}: "
+            f"{self.prefix}{self.value:.1f}{self.unit}"
+        )
+        label_surface = font.render(
+            label_text,
+            True,
+            (255, 255, 255),
+        )
+        screen.blit(
+            label_surface,
+            (self.rect.x, self.rect.y - 24),
+        )
+
+
 # Function to draw gradient-filled rounded rectangles
 def draw_gradient_button(screen, rect, color_top, color_bottom, border_radius=12):
     gradient_surface = pygame.Surface(rect.size, pygame.SRCALPHA)
