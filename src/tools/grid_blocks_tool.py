@@ -5,7 +5,7 @@ import numpy as np  # Import numpy for pixel array manipulation
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from src import config
-from src.engine import storage
+from src.engine.land_data import LAND_CELLS
 from src.engine.coord_convert import grid_to_latitude, grid_to_longitude
 # The local grid_to_latitude/grid_to_longitude that used to live here were a
 # third, slightly different copy of the same math in coord_convert.py (this
@@ -112,7 +112,7 @@ while running:
     foreground()         # Draw the foreground image
 
     # Draw a colored rectangle on each black cell found
-    for cell_coords in storage.Backup_black_cells:
+    for cell_coords in LAND_CELLS:
         x, y = cell_coords
         # Draw a rectangle where the black cells are
         rect_x = map_position[0] + x * grid_size

@@ -387,31 +387,36 @@ def combine_csv_files(file1_path, file2_path, output_path):
 
 
 def split_data_evenly(input_file, output_dir):
-    """
-    Split the combined data file into an equal number of rows across specified splits.
-    
+    """Split a combined CSV into one date-stamped voyage snapshot per day.
+
+    Each output uses ``voyage_snapshot_YYYY-MM-DD.csv`` so the pipeline's
+    output matches the historical snapshot loader used by the app.
+
     Args:
-        input_file (str): Path to the input combined CSV file.
-        output_dir (str): Directory to save the split CSV files.
-        num_splits (int): Number of splits required.
-    
+        input_file: Path to the combined input CSV. Must contain a ``date`` column.
+        output_dir: Directory in which to save the snapshot CSV files.
+
     Returns:
         str: Path to the output directory.
     """
-    # Read the data
     data = pd.read_csv(input_file)
-    
-    unique_dates = data['date'].unique()
-    output_dir = 'split_by_date'
-    output_dir_path = Path(output_dir)
-    output_dir_path.mkdir(exist_ok=True)
+    if "date" not in data.columns:
+        raise ValueError("Input CSV must contain a 'date' column")
 
-    for date in unique_dates:
-        date_data = data[data['date'] == date].drop(columns=['date'])
-        
-        output_file = output_dir_path / f"data_{date}.csv"
+    output_dir_path = Path(output_dir)
+    output_dir_path.mkdir(parents=True, exist_ok=True)
+
+    for date in data["date"].dropna().unique():
+        try:
+            date_str = pd.to_datetime(date, errors="raise").strftime("%Y-%m-%d")
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Could not interpret snapshot date {date!r}") from exc
+
+        date_data = data[data["date"] == date].drop(columns=["date"])
+        output_file = output_dir_path / f"voyage_snapshot_{date_str}.csv"
         date_data.to_csv(output_file, index=False)
-    return output_dir
+
+    return str(output_dir_path)
 
 def main():
     print("Starting Comprehensive Weather Data Processing...")

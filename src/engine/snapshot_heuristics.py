@@ -1,7 +1,7 @@
 """
 Historical voyage simulation (Phase 2C) — build a temporary heuristic
 override from one of the dated weather snapshots under
-data/snapshots/split_by_date/ (data_<date>.csv, one row per grid cell),
+data/snapshots/split_by_date/ (voyage_snapshot_<date>.csv, one row per grid cell),
 instead of using the trained heuristics_data.pkl.
 
 No pygame dependency — this is engine-layer, same as the rest of
@@ -30,21 +30,21 @@ from src import config
 from src.engine.coord_convert import round_latitude, round_longitude
 
 _SNAPSHOT_DIR = config.SNAPSHOTS_DIR / "split_by_date"
-_FILENAME_RE = re.compile(r"^data_(.+)\.csv$")
+_FILENAME_RE = re.compile(r"^voyage_snapshot_(\d{4}-\d{2}-\d{2})\.csv$")
 
 _heuristic_cache = {}   # date_str -> {(lon, lat): float}
 _dates_cache = None     # sorted list of date_str, cached after first directory scan
 
 
 def list_available_dates() -> list:
-    """Scan data/snapshots/split_by_date/ for data_<date>.csv files, sorted."""
+    """Scan for voyage_snapshot_YYYY-MM-DD.csv files and return sorted dates."""
     global _dates_cache
     if _dates_cache is not None:
         return _dates_cache
 
     dates = []
     if _SNAPSHOT_DIR.is_dir():
-        for path in _SNAPSHOT_DIR.glob("data_*.csv"):
+        for path in _SNAPSHOT_DIR.glob("voyage_snapshot_*.csv"):
             m = _FILENAME_RE.match(path.name)
             if m:
                 dates.append(m.group(1))
@@ -112,7 +112,7 @@ def load_snapshot_heuristic(date_str: str) -> dict:
     if date_str in _heuristic_cache:
         return _heuristic_cache[date_str]
 
-    path = _SNAPSHOT_DIR / f"data_{date_str}.csv"
+    path = _SNAPSHOT_DIR / f"voyage_snapshot_{date_str}.csv"
     try:
         df = pd.read_csv(path)
         heuristic = _build_heuristic_dict(df)

@@ -40,9 +40,9 @@ from src.engine import current_retriever as current_retriever_module
 
 from src.engine import fuel_retriever as fuel_retriever_module
 
-from src.engine import storage
 
 from src.engine import snapshot_heuristics
+from src.engine.land_data import LAND_CELLS
 
 from src import config
 
@@ -138,7 +138,7 @@ class RouteParams:
 
         self.mode = mode
 
-        self.land_cells = land_cells or set()
+        self.land_cells = LAND_CELLS if land_cells is None else set(land_cells)
 
         self.depth_grid = depth_grid or {}
 
@@ -463,10 +463,6 @@ def get_neighbors(pos: tuple, params: RouteParams):
 
             continue
 
-        if (nx, ny) in storage.Backup_black_cells:
-
-            continue
-
         if (nx, ny) in nogo_cells:
 
             continue
@@ -757,10 +753,6 @@ def _nearby_navigable_port_cells(port, params, max_radius=3, limit=4):
                     continue
 
                 if cell in params.land_cells:
-
-                    continue
-
-                if cell in storage.Backup_black_cells:
 
                     continue
 
