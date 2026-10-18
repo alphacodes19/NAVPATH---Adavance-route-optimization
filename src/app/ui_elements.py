@@ -51,7 +51,7 @@ CLICK_EFFECT_COLOR_BOTTOM = (0, 50, 100)
 # Input box properties
 input_boxes_position = [(670, 70), (670, 120), (910, 70), (910, 120)]
 ship_dim_button_pos = [(900, 420), (1025, 420), (1150, 420), (1275, 420)]  # lbh dim
-ship_dim = [(780, 440), (880, 440), (980, 440), (1080, 440)]
+ship_dim = [(780, 566), (880, 566), (980, 566), (1080, 566)]
 input_box_width = 50 * 1.8
 input_box_height = 40 * 1.1
 input_boxes = ["", "", "", ""]
@@ -65,7 +65,7 @@ button_values = ["", "", "", ""]
 # Fuel/Speed/Comfort sub-priority buttons. Shared by draw_new_input_boxes()
 # and handle_mouse_click() so they always agree on hit areas.
 _MODE_BTN_W, _MODE_BTN_H = 110, 54
-_MODE_START_X, _MODE_START_Y = 833, 300
+_MODE_START_X, _MODE_START_Y = 833, 330
 _SUB_BTN_H = 36
 _SUB_Y = _MODE_START_Y + 70
 
@@ -90,12 +90,12 @@ date_selection = -1    # index into list_available_dates(); -1 = Default (traine
 date_b_selection = -1  # second date, only used by the Compare Dates button
 
 _DATE_SEL_X = {"a": 670, "b": 970}
-_DATE_SEL_Y_TITLE = 409
-_DATE_SEL_Y = 425
+_DATE_SEL_Y_TITLE = 620
+_DATE_SEL_Y = 636
 _DATE_SEL_H = 30
 _DATE_ARROW_W = 30
 _DATE_NAME_W = 220
-_DATE_DIFF_BTN_RECT = pygame.Rect(670, 465, 580, 34)
+_DATE_DIFF_BTN_RECT = pygame.Rect(670, 676, 580, 34)
 
 # --- Vessel profile selector (Phase 2D-2) ----------------------------------
 # One arrow-selector that auto-fills the existing L/B/H/Eff ship-dimension
@@ -106,8 +106,8 @@ _DATE_DIFF_BTN_RECT = pygame.Rect(670, 465, 580, 34)
 vessel_selection = -1  # index into VESSELS; -1 = Manual (boxes left as typed)
 
 _VESSEL_SEL_X = 1250
-_VESSEL_SEL_Y_TITLE = 405
-_VESSEL_SEL_Y = 420
+_VESSEL_SEL_Y_TITLE = 546
+_VESSEL_SEL_Y = 566
 _VESSEL_ARROW_W = 30
 _VESSEL_SEL_H = 34
 _VESSEL_NAME_W = 220
@@ -434,8 +434,8 @@ def draw_dim_boxes(screen):
     labels = ["L:", "B:", "H:", "Eff:"]
     horizontal_spacing = 100  # Adjust the spacing between boxes
     start_x = 790  # Starting X position for the first box
-    start_y_label = 420  # Y position for labels
-    start_y_box = 440  # Y position for input boxes
+    start_y_label = 546  # Y position for labels
+    start_y_box = 566  # Y position for input boxes
 
     for i, label in enumerate(labels):
         # Calculate positions based on spacing
@@ -610,10 +610,10 @@ def handle_dir_input(event):
 
     # Define the dimensions and positions of the input boxes
     input_box_positions = [
-        (780, 440),  # Box 1 position
-        (880, 440),  # Box 2 position
-        (980, 440),  # Box 3 position
-        (1080, 440)  # Box 4 position
+        (780, 566),  # Box 1 position
+        (880, 566),  # Box 2 position
+        (980, 566),  # Box 3 position
+        (1080, 566)  # Box 4 position
     ]
     dim_box_width = 100  # Width of each input box
     dim_box_height = 40  # Height of each input box
@@ -765,7 +765,7 @@ def draw_pareto_button(screen, is_active=False):
     same open column (x=1250+) to the right of the already-packed
     670-1230 control area.
     """
-    button_rect = pygame.Rect(1250, 470, 230, 40)
+    button_rect = pygame.Rect(1250, 330, 230, 40)
     shadow_rect = button_rect.copy()
     shadow_rect.topleft = (shadow_rect.x + 3, shadow_rect.y + 3)
     pygame.draw.rect(screen, SHADOW_COLOR, shadow_rect, border_radius=8)
@@ -786,7 +786,7 @@ def draw_benchmark_button(screen, is_active=False):
     see src/engine/benchmark.py. Sits directly below the Pareto Sweep
     button, same open column.
     """
-    button_rect = pygame.Rect(1250, 515, 230, 40)
+    button_rect = pygame.Rect(1250, 380, 230, 40)
     shadow_rect = button_rect.copy()
     shadow_rect.topleft = (shadow_rect.x + 3, shadow_rect.y + 3)
     pygame.draw.rect(screen, SHADOW_COLOR, shadow_rect, border_radius=8)
@@ -808,7 +808,7 @@ def draw_voyage_button(screen, enabled: bool, is_active: bool = False):
     voyage is already running, the label changes to make restarting explicit.
     Returns the button rectangle for main.py hit-testing.
     """
-    button_rect = pygame.Rect(1250, 560, 230, 40)
+    button_rect = pygame.Rect(1250, 430, 230, 40)
     shadow_rect = button_rect.copy()
     shadow_rect.topleft = (shadow_rect.x + 3, shadow_rect.y + 3)
     pygame.draw.rect(screen, SHADOW_COLOR, shadow_rect, border_radius=8)
@@ -835,7 +835,7 @@ def draw_voyage_button(screen, enabled: bool, is_active: bool = False):
 
 def draw_fuel_estimation_button(screen):
     """Toggle the fuel-estimation detail overlay (see src/app/route_panel.py)."""
-    button_rect = pygame.Rect(670, 378, 560, 40)
+    button_rect = pygame.Rect(670, 496, 560, 40)
     shadow_rect = button_rect.copy()
     shadow_rect.topleft = (shadow_rect.x + 2, shadow_rect.y + 2)
     pygame.draw.rect(screen, SHADOW_COLOR, shadow_rect, border_radius=6)
@@ -859,7 +859,7 @@ def draw_retrain_model_button(screen):
 
 def draw_path_coordinates_button(screen):
     """Export the current route to CSV and GPX (see src/engine/exporter.py)."""
-    button_rect = pygame.Rect(670, 330, 560, 40)  # below the mode buttons
+    button_rect = pygame.Rect(670, 446, 560, 40)  # below the mode/sub-priority block
     shadow_rect = button_rect.copy()
     shadow_rect.topleft = (shadow_rect.x + 2, shadow_rect.y + 2)
     pygame.draw.rect(screen, SHADOW_COLOR, shadow_rect, border_radius=6)
