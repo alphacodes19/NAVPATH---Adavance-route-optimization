@@ -51,7 +51,7 @@ CLICK_EFFECT_COLOR_BOTTOM = (0, 50, 100)
 # Input box properties
 input_boxes_position = [(670, 70), (670, 120), (910, 70), (910, 120)]
 ship_dim_button_pos = [(900, 420), (1025, 420), (1150, 420), (1275, 420)]  # lbh dim
-ship_dim = [(780, 566), (880, 566), (980, 566), (1080, 566)]
+ship_dim = [(780, 880), (880, 880), (980, 880), (1080, 880)]
 input_box_width = 50 * 1.8
 input_box_height = 40 * 1.1
 input_boxes = ["", "", "", ""]
@@ -90,12 +90,12 @@ date_selection = -1    # index into list_available_dates(); -1 = Default (traine
 date_b_selection = -1  # second date, only used by the Compare Dates button
 
 _DATE_SEL_X = {"a": 670, "b": 970}
-_DATE_SEL_Y_TITLE = 620
-_DATE_SEL_Y = 636
+_DATE_SEL_Y_TITLE = 934
+_DATE_SEL_Y = 950
 _DATE_SEL_H = 30
 _DATE_ARROW_W = 30
 _DATE_NAME_W = 220
-_DATE_DIFF_BTN_RECT = pygame.Rect(670, 676, 580, 34)
+_DATE_DIFF_BTN_RECT = pygame.Rect(670, 990, 580, 34)
 
 # --- Vessel profile selector (Phase 2D-2) ----------------------------------
 # One arrow-selector that auto-fills the existing L/B/H/Eff ship-dimension
@@ -106,8 +106,8 @@ _DATE_DIFF_BTN_RECT = pygame.Rect(670, 676, 580, 34)
 vessel_selection = -1  # index into VESSELS; -1 = Manual (boxes left as typed)
 
 _VESSEL_SEL_X = 1250
-_VESSEL_SEL_Y_TITLE = 546
-_VESSEL_SEL_Y = 566
+_VESSEL_SEL_Y_TITLE = 860
+_VESSEL_SEL_Y = 880
 _VESSEL_ARROW_W = 30
 _VESSEL_SEL_H = 34
 _VESSEL_NAME_W = 220
@@ -434,8 +434,8 @@ def draw_dim_boxes(screen):
     labels = ["L:", "B:", "H:", "Eff:"]
     horizontal_spacing = 100  # Adjust the spacing between boxes
     start_x = 790  # Starting X position for the first box
-    start_y_label = 546  # Y position for labels
-    start_y_box = 566  # Y position for input boxes
+    start_y_label = 860  # Y position for labels
+    start_y_box = 880  # Y position for input boxes
 
     for i, label in enumerate(labels):
         # Calculate positions based on spacing
@@ -610,10 +610,10 @@ def handle_dir_input(event):
 
     # Define the dimensions and positions of the input boxes
     input_box_positions = [
-        (780, 566),  # Box 1 position
-        (880, 566),  # Box 2 position
-        (980, 566),  # Box 3 position
-        (1080, 566)  # Box 4 position
+        (780, 880),  # Box 1 position
+        (880, 880),  # Box 2 position
+        (980, 880),  # Box 3 position
+        (1080, 880)  # Box 4 position
     ]
     dim_box_width = 100  # Width of each input box
     dim_box_height = 40  # Height of each input box
