@@ -106,8 +106,8 @@ _DATE_DIFF_BTN_RECT = pygame.Rect(670, 990, 580, 34)
 vessel_selection = -1  # index into VESSELS; -1 = Manual (boxes left as typed)
 
 _VESSEL_SEL_X = 1250
-_VESSEL_SEL_Y_TITLE = 860
-_VESSEL_SEL_Y = 880
+_VESSEL_SEL_Y_TITLE = 920
+_VESSEL_SEL_Y = 940
 _VESSEL_ARROW_W = 30
 _VESSEL_SEL_H = 34
 _VESSEL_NAME_W = 220
